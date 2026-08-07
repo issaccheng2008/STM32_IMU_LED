@@ -1,0 +1,31 @@
+# STM32CubeIDE build output directories
+/Debug/
+/Release/
+
+# Compiled object files and build artifacts
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.map
+*.list
+*.hex
+*.bin
+*.axf
+*.mot
+*.srec
+
+# IDE-generated build files (in Debug/Release)
+*.mk
+objects.list
+objects.mk
+sources.mk
+makefile
+
+# Miscellaneous editor/backup files
+*.orig
+*.rej
+*.bak
+*.tmp
+*.swp
