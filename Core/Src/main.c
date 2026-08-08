@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "lsm6dsv320x_reg.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -46,7 +46,63 @@ I2C_HandleTypeDef hi2c1;
 TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
+static stmdev_ctx_t imu_ctx;
 
+/** Last IMU initialization or read result: 0 means success. */
+volatile int32_t imu_status = -1;
+
+/** WHO_AM_I register value; an LSM6DSV320X returns 0x73. */
+volatile uint8_t imu_who_am_i = 0U;
+
+/** Active 8-bit I2C address; selected automatically from the SDO/SA0 pin. */
+volatile uint8_t imu_i2c_address = LSM6DSV320X_I2C_ADD_L;
+
+/** Number of polling cycles in which at least one new sensor value was read. */
+volatile uint32_t imu_sample_count = 0U;
+
+/** Low-g accelerometer X-axis register value (raw signed counts). */
+volatile int16_t imu_accel_x_raw = 0;
+/** Low-g accelerometer Y-axis register value (raw signed counts). */
+volatile int16_t imu_accel_y_raw = 0;
+/** Low-g accelerometer Z-axis register value (raw signed counts). */
+volatile int16_t imu_accel_z_raw = 0;
+/** Low-g X-axis acceleration in milligravity (mg), configured for +/-4 g. */
+volatile float imu_accel_x_mg = 0.0f;
+/** Low-g Y-axis acceleration in milligravity (mg), configured for +/-4 g. */
+volatile float imu_accel_y_mg = 0.0f;
+/** Low-g Z-axis acceleration in milligravity (mg), configured for +/-4 g. */
+volatile float imu_accel_z_mg = 0.0f;
+
+/** Gyroscope X-axis register value (raw signed counts). */
+volatile int16_t imu_gyro_x_raw = 0;
+/** Gyroscope Y-axis register value (raw signed counts). */
+volatile int16_t imu_gyro_y_raw = 0;
+/** Gyroscope Z-axis register value (raw signed counts). */
+volatile int16_t imu_gyro_z_raw = 0;
+/** X-axis angular rate in degrees per second, configured for +/-500 dps. */
+volatile float imu_gyro_x_dps = 0.0f;
+/** Y-axis angular rate in degrees per second, configured for +/-500 dps. */
+volatile float imu_gyro_y_dps = 0.0f;
+/** Z-axis angular rate in degrees per second, configured for +/-500 dps. */
+volatile float imu_gyro_z_dps = 0.0f;
+
+/** High-g accelerometer X-axis register value (raw signed counts). */
+volatile int16_t imu_high_g_x_raw = 0;
+/** High-g accelerometer Y-axis register value (raw signed counts). */
+volatile int16_t imu_high_g_y_raw = 0;
+/** High-g accelerometer Z-axis register value (raw signed counts). */
+volatile int16_t imu_high_g_z_raw = 0;
+/** High-g X-axis acceleration in milligravity (mg), configured for +/-32 g. */
+volatile float imu_high_g_x_mg = 0.0f;
+/** High-g Y-axis acceleration in milligravity (mg), configured for +/-32 g. */
+volatile float imu_high_g_y_mg = 0.0f;
+/** High-g Z-axis acceleration in milligravity (mg), configured for +/-32 g. */
+volatile float imu_high_g_z_mg = 0.0f;
+
+/** Temperature output register value (raw signed counts). */
+volatile int16_t imu_temperature_raw = 0;
+/** IMU die temperature in degrees Celsius. */
+volatile float imu_temperature_c = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -56,12 +112,183 @@ static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
-
+static int32_t IMU_Init(void);
+static int32_t IMU_ReadAll(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static int32_t platform_write(void *handle, uint8_t reg,
+                              const uint8_t *buffer, uint16_t length)
+{
+  HAL_StatusTypeDef result;
 
+  result = HAL_I2C_Mem_Write((I2C_HandleTypeDef *)handle,
+                             imu_i2c_address,
+                             reg,
+                             I2C_MEMADD_SIZE_8BIT,
+                             (uint8_t *)buffer,
+                             length,
+                             100U);
+
+  return (result == HAL_OK) ? 0 : -1;
+}
+
+static int32_t platform_read(void *handle, uint8_t reg,
+                             uint8_t *buffer, uint16_t length)
+{
+  HAL_StatusTypeDef result;
+
+  result = HAL_I2C_Mem_Read((I2C_HandleTypeDef *)handle,
+                            imu_i2c_address,
+                            reg,
+                            I2C_MEMADD_SIZE_8BIT,
+                            buffer,
+                            length,
+                            100U);
+
+  return (result == HAL_OK) ? 0 : -1;
+}
+
+static void platform_delay(uint32_t milliseconds)
+{
+  HAL_Delay(milliseconds);
+}
+
+static int32_t IMU_Init(void)
+{
+  uint8_t who_am_i = 0U;
+
+  imu_ctx.write_reg = platform_write;
+  imu_ctx.read_reg = platform_read;
+  imu_ctx.mdelay = platform_delay;
+  imu_ctx.handle = &hi2c1;
+  imu_ctx.priv_data = NULL;
+
+  HAL_Delay(20U);
+
+  /* SDO/SA0 selects one of two I2C addresses, so try both. */
+  imu_i2c_address = LSM6DSV320X_I2C_ADD_L;
+  if ((lsm6dsv320x_device_id_get(&imu_ctx, &who_am_i) != 0) ||
+      (who_am_i != LSM6DSV320X_ID))
+  {
+    imu_i2c_address = LSM6DSV320X_I2C_ADD_H;
+    if ((lsm6dsv320x_device_id_get(&imu_ctx, &who_am_i) != 0) ||
+        (who_am_i != LSM6DSV320X_ID))
+    {
+      imu_who_am_i = who_am_i;
+      return -1;
+    }
+  }
+
+  imu_who_am_i = who_am_i;
+
+  if (lsm6dsv320x_sw_por(&imu_ctx) != 0)
+    return -2;
+
+  HAL_Delay(10U);
+
+  if (lsm6dsv320x_block_data_update_set(&imu_ctx, PROPERTY_ENABLE) != 0)
+    return -3;
+
+  if (lsm6dsv320x_auto_increment_set(&imu_ctx, PROPERTY_ENABLE) != 0)
+    return -4;
+
+  if (lsm6dsv320x_xl_full_scale_set(&imu_ctx, LSM6DSV320X_4g) != 0)
+    return -5;
+
+  if (lsm6dsv320x_gy_full_scale_set(&imu_ctx, LSM6DSV320X_500dps) != 0)
+    return -6;
+
+  if (lsm6dsv320x_hg_xl_full_scale_set(&imu_ctx, LSM6DSV320X_32g) != 0)
+    return -7;
+
+  if (lsm6dsv320x_xl_setup(&imu_ctx,
+                           LSM6DSV320X_ODR_AT_120Hz,
+                           LSM6DSV320X_XL_HIGH_PERFORMANCE_MD) != 0)
+    return -8;
+
+  if (lsm6dsv320x_gy_setup(&imu_ctx,
+                           LSM6DSV320X_ODR_AT_120Hz,
+                           LSM6DSV320X_GY_HIGH_PERFORMANCE_MD) != 0)
+    return -9;
+
+  if (lsm6dsv320x_hg_xl_data_rate_set(&imu_ctx,
+                                      LSM6DSV320X_HG_XL_ODR_AT_480Hz,
+                                      PROPERTY_ENABLE) != 0)
+    return -10;
+
+  HAL_Delay(50U);
+  return 0;
+}
+
+static int32_t IMU_ReadAll(void)
+{
+  lsm6dsv320x_data_ready_t data_ready = {0};
+  int16_t raw_axes[3];
+  int16_t raw_temperature;
+  uint8_t updated = 0U;
+
+  if (lsm6dsv320x_flag_data_ready_get(&imu_ctx, &data_ready) != 0)
+    return -20;
+
+  if (data_ready.drdy_xl != 0U)
+  {
+    if (lsm6dsv320x_acceleration_raw_get(&imu_ctx, raw_axes) != 0)
+      return -21;
+
+    imu_accel_x_raw = raw_axes[0];
+    imu_accel_y_raw = raw_axes[1];
+    imu_accel_z_raw = raw_axes[2];
+    imu_accel_x_mg = lsm6dsv320x_from_fs4_to_mg(raw_axes[0]);
+    imu_accel_y_mg = lsm6dsv320x_from_fs4_to_mg(raw_axes[1]);
+    imu_accel_z_mg = lsm6dsv320x_from_fs4_to_mg(raw_axes[2]);
+    updated = 1U;
+  }
+
+  if (data_ready.drdy_gy != 0U)
+  {
+    if (lsm6dsv320x_angular_rate_raw_get(&imu_ctx, raw_axes) != 0)
+      return -22;
+
+    imu_gyro_x_raw = raw_axes[0];
+    imu_gyro_y_raw = raw_axes[1];
+    imu_gyro_z_raw = raw_axes[2];
+    imu_gyro_x_dps = lsm6dsv320x_from_fs500_to_mdps(raw_axes[0]) / 1000.0f;
+    imu_gyro_y_dps = lsm6dsv320x_from_fs500_to_mdps(raw_axes[1]) / 1000.0f;
+    imu_gyro_z_dps = lsm6dsv320x_from_fs500_to_mdps(raw_axes[2]) / 1000.0f;
+    updated = 1U;
+  }
+
+  if (data_ready.drdy_hgxl != 0U)
+  {
+    if (lsm6dsv320x_hg_acceleration_raw_get(&imu_ctx, raw_axes) != 0)
+      return -23;
+
+    imu_high_g_x_raw = raw_axes[0];
+    imu_high_g_y_raw = raw_axes[1];
+    imu_high_g_z_raw = raw_axes[2];
+    imu_high_g_x_mg = lsm6dsv320x_from_fs32_to_mg(raw_axes[0]);
+    imu_high_g_y_mg = lsm6dsv320x_from_fs32_to_mg(raw_axes[1]);
+    imu_high_g_z_mg = lsm6dsv320x_from_fs32_to_mg(raw_axes[2]);
+    updated = 1U;
+  }
+
+  if (data_ready.drdy_temp != 0U)
+  {
+    if (lsm6dsv320x_temperature_raw_get(&imu_ctx, &raw_temperature) != 0)
+      return -24;
+
+    imu_temperature_raw = raw_temperature;
+    imu_temperature_c = lsm6dsv320x_from_lsb_to_celsius(raw_temperature);
+    updated = 1U;
+  }
+
+  if (updated != 0U)
+    imu_sample_count++;
+
+  return 0;
+}
 /* USER CODE END 0 */
 
 /**
@@ -99,13 +326,24 @@ int main(void)
   MX_I2C1_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+  imu_status = IMU_Init();
 
+  /* Stop here on initialization failure so imu_status stays visible. */
+  if (imu_status != 0)
+  {
+    while (1)
+    {
+      HAL_Delay(100U);
+    }
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    imu_status = IMU_ReadAll();
+    HAL_Delay(1U);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
