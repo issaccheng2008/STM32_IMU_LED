@@ -32,7 +32,12 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define MS2_PER_MG                              0.00980665f
+#define CALIBRATION_SAMPLES                     200U
+#define CALIBRATION_TIMEOUT_MS                  6000U
+#define STATIONARY_LINEAR_ACCEL_THRESHOLD_MS2   0.12f
+#define STATIONARY_GYRO_THRESHOLD_DPS           1.5f
+#define STATIONARY_DWELL_SAMPLES                24U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -58,13 +63,25 @@ volatile float acc_x_ms2 = 0.0f;
 volatile float acc_y_ms2 = 0.0f;
 volatile float acc_z_ms2 = 0.0f;
 
+volatile float gravity_x_ms2 = 0.0f;
+volatile float gravity_y_ms2 = 0.0f;
+volatile float gravity_z_ms2 = 0.0f;
+
+volatile float linear_acc_x_ms2 = 0.0f;
+volatile float linear_acc_y_ms2 = 0.0f;
+volatile float linear_acc_z_ms2 = 0.0f;
+
 volatile float gyro_x_dps = 0.0f;
 volatile float gyro_y_dps = 0.0f;
 volatile float gyro_z_dps = 0.0f;
 
+volatile float quaternion_w = 1.0f;
+volatile float quaternion_x = 0.0f;
+volatile float quaternion_y = 0.0f;
+volatile float quaternion_z = 0.0f;
+
 volatile uint32_t imu_sample_count = 0;
 
-/* Later used by position estimator */
 volatile float velocity_x_ms = 0.0f;
 volatile float velocity_y_ms = 0.0f;
 volatile float velocity_z_ms = 0.0f;
@@ -73,10 +90,27 @@ volatile float position_x_m = 0.0f;
 volatile float position_y_m = 0.0f;
 volatile float position_z_m = 0.0f;
 
-static float accel_zero_x = 0.0f;
-static float accel_zero_y = 0.0f;
-static float accel_zero_z = 0.0f;
+static lsm6dsv320x_quaternion_t orientation_quaternion =
+{
+    .quat_w = 1.0f,
+    .quat_x = 0.0f,
+    .quat_y = 0.0f,
+    .quat_z = 0.0f
+};
 
+static lsm6dsv320x_quaternion_t initial_orientation_quaternion =
+{
+    .quat_w = 1.0f,
+    .quat_x = 0.0f,
+    .quat_y = 0.0f,
+    .quat_z = 0.0f
+};
+
+static float accel_bias_body_x = 0.0f;
+static float accel_bias_body_y = 0.0f;
+static float accel_bias_body_z = 0.0f;
+
+static uint16_t stationary_sample_count = 0U;
 static uint32_t previous_time_us = 0;
 /* USER CODE END PV */
 
@@ -138,6 +172,132 @@ static void platform_delay(uint32_t ms)
     HAL_Delay(ms);
 }
 
+
+static lsm6dsv320x_quaternion_t Quaternion_Multiply(
+        const lsm6dsv320x_quaternion_t *a,
+        const lsm6dsv320x_quaternion_t *b)
+{
+    lsm6dsv320x_quaternion_t result;
+
+    result.quat_w =
+        a->quat_w * b->quat_w -
+        a->quat_x * b->quat_x -
+        a->quat_y * b->quat_y -
+        a->quat_z * b->quat_z;
+
+    result.quat_x =
+        a->quat_w * b->quat_x +
+        a->quat_x * b->quat_w +
+        a->quat_y * b->quat_z -
+        a->quat_z * b->quat_y;
+
+    result.quat_y =
+        a->quat_w * b->quat_y -
+        a->quat_x * b->quat_z +
+        a->quat_y * b->quat_w +
+        a->quat_z * b->quat_x;
+
+    result.quat_z =
+        a->quat_w * b->quat_z +
+        a->quat_x * b->quat_y -
+        a->quat_y * b->quat_x +
+        a->quat_z * b->quat_w;
+
+    return result;
+}
+
+
+static int32_t Quaternion_Rotate_Vector(
+        const lsm6dsv320x_quaternion_t *q,
+        float vx,
+        float vy,
+        float vz,
+        float *rx,
+        float *ry,
+        float *rz)
+{
+    float norm_squared;
+    float ww;
+    float xx;
+    float yy;
+    float zz;
+
+    norm_squared =
+        q->quat_w * q->quat_w +
+        q->quat_x * q->quat_x +
+        q->quat_y * q->quat_y +
+        q->quat_z * q->quat_z;
+
+    if ((norm_squared < 0.25f) || (norm_squared > 2.25f))
+        return -1;
+
+    ww = q->quat_w * q->quat_w;
+    xx = q->quat_x * q->quat_x;
+    yy = q->quat_y * q->quat_y;
+    zz = q->quat_z * q->quat_z;
+
+    /*
+     * The SFLP game-rotation quaternion rotates sensor-frame vectors into
+     * its fixed reference frame. Divide by |q|^2 so half-float rounding
+     * cannot scale the rotated acceleration.
+     */
+    *rx =
+        ((ww + xx - yy - zz) * vx +
+         2.0f * (q->quat_x * q->quat_y -
+                 q->quat_w * q->quat_z) * vy +
+         2.0f * (q->quat_x * q->quat_z +
+                 q->quat_w * q->quat_y) * vz) / norm_squared;
+
+    *ry =
+        (2.0f * (q->quat_x * q->quat_y +
+                 q->quat_w * q->quat_z) * vx +
+         (ww - xx + yy - zz) * vy +
+         2.0f * (q->quat_y * q->quat_z -
+                 q->quat_w * q->quat_x) * vz) / norm_squared;
+
+    *rz =
+        (2.0f * (q->quat_x * q->quat_z -
+                 q->quat_w * q->quat_y) * vx +
+         2.0f * (q->quat_y * q->quat_z +
+                 q->quat_w * q->quat_x) * vy +
+         (ww - xx - yy + zz) * vz) / norm_squared;
+
+    return 0;
+}
+
+
+static int32_t Body_To_Initial_Frame(float body_x,
+                                     float body_y,
+                                     float body_z,
+                                     float *initial_x,
+                                     float *initial_y,
+                                     float *initial_z)
+{
+    lsm6dsv320x_quaternion_t initial_conjugate;
+    lsm6dsv320x_quaternion_t relative_orientation;
+
+    initial_conjugate.quat_w = initial_orientation_quaternion.quat_w;
+    initial_conjugate.quat_x = -initial_orientation_quaternion.quat_x;
+    initial_conjugate.quat_y = -initial_orientation_quaternion.quat_y;
+    initial_conjugate.quat_z = -initial_orientation_quaternion.quat_z;
+
+    /*
+     * q_relative = conjugate(q_at_reset) * q_now.
+     * This makes the estimator axes match the IMU axes at reset.
+     */
+    relative_orientation =
+        Quaternion_Multiply(&initial_conjugate, &orientation_quaternion);
+
+    return Quaternion_Rotate_Vector(&relative_orientation,
+                                    body_x,
+                                    body_y,
+                                    body_z,
+                                    initial_x,
+                                    initial_y,
+                                    initial_z);
+}
+
+
 static int32_t IMU_Init(void)
 {
     int32_t ret;
@@ -150,21 +310,15 @@ static int32_t IMU_Init(void)
 
     HAL_Delay(20);
 
-    /*
-     * First test communication BEFORE changing any registers.
-     */
     ret = lsm6dsv320x_device_id_get(&imu_ctx,
                                     (uint8_t *)&imu_whoami);
 
     if (ret != 0)
-        return -1;      /* I2C communication error */
+        return -1;
 
     if (imu_whoami != LSM6DSV320X_ID)
-        return -2;      /* Wrong device / wrong address */
+        return -2;
 
-    /*
-     * Reset configuration.
-     */
     ret = lsm6dsv320x_sw_por(&imu_ctx);
 
     if (ret != 0)
@@ -172,9 +326,6 @@ static int32_t IMU_Init(void)
 
     HAL_Delay(10);
 
-    /*
-     * Protect 16-bit data while reading.
-     */
     ret = lsm6dsv320x_block_data_update_set(
             &imu_ctx,
             PROPERTY_ENABLE);
@@ -182,9 +333,6 @@ static int32_t IMU_Init(void)
     if (ret != 0)
         return -4;
 
-    /*
-     * Enable register auto-increment.
-     */
     ret = lsm6dsv320x_auto_increment_set(
             &imu_ctx,
             PROPERTY_ENABLE);
@@ -192,10 +340,6 @@ static int32_t IMU_Init(void)
     if (ret != 0)
         return -5;
 
-    /*
-     * Low-g accelerometer:
-     * +/-4 g
-     */
     ret = lsm6dsv320x_xl_full_scale_set(
             &imu_ctx,
             LSM6DSV320X_4g);
@@ -203,10 +347,6 @@ static int32_t IMU_Init(void)
     if (ret != 0)
         return -6;
 
-    /*
-     * Gyroscope:
-     * +/-500 degrees/sec
-     */
     ret = lsm6dsv320x_gy_full_scale_set(
             &imu_ctx,
             LSM6DSV320X_500dps);
@@ -214,11 +354,6 @@ static int32_t IMU_Init(void)
     if (ret != 0)
         return -7;
 
-    /*
-     * Accelerometer:
-     * 120 Hz
-     * High-performance mode
-     */
     ret = lsm6dsv320x_xl_setup(
             &imu_ctx,
             LSM6DSV320X_ODR_AT_120Hz,
@@ -227,11 +362,6 @@ static int32_t IMU_Init(void)
     if (ret != 0)
         return -8;
 
-    /*
-     * Gyroscope:
-     * 120 Hz
-     * High-performance mode
-     */
     ret = lsm6dsv320x_gy_setup(
             &imu_ctx,
             LSM6DSV320X_ODR_AT_120Hz,
@@ -240,16 +370,39 @@ static int32_t IMU_Init(void)
     if (ret != 0)
         return -9;
 
-    HAL_Delay(50);
+    /*
+     * SFLP estimates orientation, gravity, and gyroscope bias from the
+     * low-g accelerometer and gyroscope. Its ODR must not exceed theirs.
+     */
+    ret = lsm6dsv320x_sflp_data_rate_set(
+            &imu_ctx,
+            LSM6DSV320X_SFLP_120Hz);
+
+    if (ret != 0)
+        return -10;
+
+    ret = lsm6dsv320x_sflp_game_rotation_set(
+            &imu_ctx,
+            PROPERTY_ENABLE);
+
+    if (ret != 0)
+        return -11;
+
+    /* Allow filters to start before calibration begins. */
+    HAL_Delay(250);
 
     return 0;
 }
 
+
 static int32_t IMU_Read(void)
 {
     lsm6dsv320x_data_ready_t drdy;
-    int16_t raw[3];
-
+    lsm6dsv320x_quaternion_t quaternion;
+    int16_t acceleration_raw[3];
+    int16_t gravity_raw[3];
+    int16_t angular_rate_raw[3];
+    float quaternion_norm_squared;
     int32_t ret;
 
     ret = lsm6dsv320x_flag_data_ready_get(
@@ -259,97 +412,186 @@ static int32_t IMU_Read(void)
     if (ret != 0)
         return -1;
 
-    /*
-     * Accelerometer
-     */
     if (drdy.drdy_xl)
     {
         ret = lsm6dsv320x_acceleration_raw_get(
                 &imu_ctx,
-                raw);
+                acceleration_raw);
 
         if (ret != 0)
             return -2;
 
-        /*
-         * Driver converts raw values -> mg.
-         *
-         * 1 mg = 0.00980665 m/s^2
-         */
-        acc_x_ms2 =
-            lsm6dsv320x_from_fs4_to_mg(raw[0])
-            * 0.00980665f;
-
-        acc_y_ms2 =
-            lsm6dsv320x_from_fs4_to_mg(raw[1])
-            * 0.00980665f;
-
-        acc_z_ms2 =
-            lsm6dsv320x_from_fs4_to_mg(raw[2])
-            * 0.00980665f;
-
-        imu_sample_count++;
-    }
-
-    /*
-     * Gyroscope
-     */
-    if (drdy.drdy_gy)
-    {
-        ret = lsm6dsv320x_angular_rate_raw_get(
+        ret = lsm6dsv320x_sflp_gravity_raw_get(
                 &imu_ctx,
-                raw);
+                gravity_raw);
 
         if (ret != 0)
             return -3;
 
+        ret = lsm6dsv320x_sflp_quaternion_get(
+                &imu_ctx,
+                &quaternion);
+
+        if (ret != 0)
+            return -4;
+
+        quaternion_norm_squared =
+            quaternion.quat_w * quaternion.quat_w +
+            quaternion.quat_x * quaternion.quat_x +
+            quaternion.quat_y * quaternion.quat_y +
+            quaternion.quat_z * quaternion.quat_z;
+
         /*
-         * Driver returns mdps.
-         * Convert mdps -> deg/s.
+         * SFLP output is zero while starting. Do not publish a sample until
+         * it contains a plausible unit quaternion.
          */
+        if ((quaternion_norm_squared < 0.25f) ||
+            (quaternion_norm_squared > 2.25f))
+        {
+            return -5;
+        }
+
+        acc_x_ms2 =
+            lsm6dsv320x_from_fs4_to_mg(acceleration_raw[0])
+            * MS2_PER_MG;
+
+        acc_y_ms2 =
+            lsm6dsv320x_from_fs4_to_mg(acceleration_raw[1])
+            * MS2_PER_MG;
+
+        acc_z_ms2 =
+            lsm6dsv320x_from_fs4_to_mg(acceleration_raw[2])
+            * MS2_PER_MG;
+
+        gravity_x_ms2 =
+            lsm6dsv320x_from_sflp_to_mg(gravity_raw[0])
+            * MS2_PER_MG;
+
+        gravity_y_ms2 =
+            lsm6dsv320x_from_sflp_to_mg(gravity_raw[1])
+            * MS2_PER_MG;
+
+        gravity_z_ms2 =
+            lsm6dsv320x_from_sflp_to_mg(gravity_raw[2])
+            * MS2_PER_MG;
+
+        orientation_quaternion = quaternion;
+
+        quaternion_w = quaternion.quat_w;
+        quaternion_x = quaternion.quat_x;
+        quaternion_y = quaternion.quat_y;
+        quaternion_z = quaternion.quat_z;
+
+        imu_sample_count++;
+    }
+
+    if (drdy.drdy_gy)
+    {
+        ret = lsm6dsv320x_angular_rate_raw_get(
+                &imu_ctx,
+                angular_rate_raw);
+
+        if (ret != 0)
+            return -6;
+
         gyro_x_dps =
-            lsm6dsv320x_from_fs500_to_mdps(raw[0])
+            lsm6dsv320x_from_fs500_to_mdps(angular_rate_raw[0])
             / 1000.0f;
 
         gyro_y_dps =
-            lsm6dsv320x_from_fs500_to_mdps(raw[1])
+            lsm6dsv320x_from_fs500_to_mdps(angular_rate_raw[1])
             / 1000.0f;
 
         gyro_z_dps =
-            lsm6dsv320x_from_fs500_to_mdps(raw[2])
+            lsm6dsv320x_from_fs500_to_mdps(angular_rate_raw[2])
             / 1000.0f;
     }
 
     return 0;
 }
 
-static void IMU_Calibrate(void)
+
+static int32_t IMU_Calibrate(void)
 {
-    float sx = 0.0f;
-    float sy = 0.0f;
-    float sz = 0.0f;
+    float bias_sum_x = 0.0f;
+    float bias_sum_y = 0.0f;
+    float bias_sum_z = 0.0f;
+    float quaternion_sum_w = 0.0f;
+    float quaternion_sum_x = 0.0f;
+    float quaternion_sum_y = 0.0f;
+    float quaternion_sum_z = 0.0f;
+    lsm6dsv320x_quaternion_t reference_quaternion;
+    lsm6dsv320x_quaternion_t sample_quaternion;
+    uint32_t calibration_start_ms;
+    uint32_t samples = 0U;
+    uint8_t have_reference = 0U;
 
-    uint32_t samples = 0;
+    calibration_start_ms = HAL_GetTick();
 
-    while (samples < 200)
+    while (samples < CALIBRATION_SAMPLES)
     {
         uint32_t before = imu_sample_count;
+        float sign = 1.0f;
 
-        IMU_Read();
-
-        if (imu_sample_count != before)
+        if ((HAL_GetTick() - calibration_start_ms) >
+            CALIBRATION_TIMEOUT_MS)
         {
-            sx += acc_x_ms2;
-            sy += acc_y_ms2;
-            sz += acc_z_ms2;
-
-            samples++;
+            return -1;
         }
+
+        if (IMU_Read() != 0)
+        {
+            HAL_Delay(1);
+            continue;
+        }
+
+        if (imu_sample_count == before)
+            continue;
+
+        /*
+         * SFLP gravity is in the sensor frame, so the remaining stationary
+         * acceleration is the sensor residual bias in that same frame.
+         */
+        bias_sum_x += acc_x_ms2 - gravity_x_ms2;
+        bias_sum_y += acc_y_ms2 - gravity_y_ms2;
+        bias_sum_z += acc_z_ms2 - gravity_z_ms2;
+
+        sample_quaternion = orientation_quaternion;
+
+        if (!have_reference)
+        {
+            reference_quaternion = sample_quaternion;
+            have_reference = 1U;
+        }
+        else if ((sample_quaternion.quat_w * reference_quaternion.quat_w +
+                  sample_quaternion.quat_x * reference_quaternion.quat_x +
+                  sample_quaternion.quat_y * reference_quaternion.quat_y +
+                  sample_quaternion.quat_z * reference_quaternion.quat_z) < 0.0f)
+        {
+            /* q and -q represent the same orientation; align before averaging. */
+            sign = -1.0f;
+        }
+
+        quaternion_sum_w += sign * sample_quaternion.quat_w;
+        quaternion_sum_x += sign * sample_quaternion.quat_x;
+        quaternion_sum_y += sign * sample_quaternion.quat_y;
+        quaternion_sum_z += sign * sample_quaternion.quat_z;
+
+        samples++;
     }
 
-    accel_zero_x = sx / 200.0f;
-    accel_zero_y = sy / 200.0f;
-    accel_zero_z = sz / 200.0f;
+    accel_bias_body_x = bias_sum_x / (float)CALIBRATION_SAMPLES;
+    accel_bias_body_y = bias_sum_y / (float)CALIBRATION_SAMPLES;
+    accel_bias_body_z = bias_sum_z / (float)CALIBRATION_SAMPLES;
+
+    initial_orientation_quaternion.quat_w =
+        quaternion_sum_w / (float)CALIBRATION_SAMPLES;
+    initial_orientation_quaternion.quat_x =
+        quaternion_sum_x / (float)CALIBRATION_SAMPLES;
+    initial_orientation_quaternion.quat_y =
+        quaternion_sum_y / (float)CALIBRATION_SAMPLES;
+    initial_orientation_quaternion.quat_z =
+        quaternion_sum_z / (float)CALIBRATION_SAMPLES;
 
     velocity_x_ms = 0.0f;
     velocity_y_ms = 0.0f;
@@ -359,17 +601,44 @@ static void IMU_Calibrate(void)
     position_y_m = 0.0f;
     position_z_m = 0.0f;
 
+    linear_acc_x_ms2 = 0.0f;
+    linear_acc_y_ms2 = 0.0f;
+    linear_acc_z_ms2 = 0.0f;
+
+    stationary_sample_count = 0U;
     previous_time_us = __HAL_TIM_GET_COUNTER(&htim2);
+
+    return 0;
 }
+
+
+static uint8_t Is_Stationary(float ax, float ay, float az)
+{
+    return
+        (ax > -STATIONARY_LINEAR_ACCEL_THRESHOLD_MS2) &&
+        (ax <  STATIONARY_LINEAR_ACCEL_THRESHOLD_MS2) &&
+        (ay > -STATIONARY_LINEAR_ACCEL_THRESHOLD_MS2) &&
+        (ay <  STATIONARY_LINEAR_ACCEL_THRESHOLD_MS2) &&
+        (az > -STATIONARY_LINEAR_ACCEL_THRESHOLD_MS2) &&
+        (az <  STATIONARY_LINEAR_ACCEL_THRESHOLD_MS2) &&
+        (gyro_x_dps > -STATIONARY_GYRO_THRESHOLD_DPS) &&
+        (gyro_x_dps <  STATIONARY_GYRO_THRESHOLD_DPS) &&
+        (gyro_y_dps > -STATIONARY_GYRO_THRESHOLD_DPS) &&
+        (gyro_y_dps <  STATIONARY_GYRO_THRESHOLD_DPS) &&
+        (gyro_z_dps > -STATIONARY_GYRO_THRESHOLD_DPS) &&
+        (gyro_z_dps <  STATIONARY_GYRO_THRESHOLD_DPS);
+}
+
 
 static void Position_Update(void)
 {
     uint32_t old_sample;
     uint32_t now_us;
     uint32_t elapsed_us;
-
     float dt;
-
+    float body_ax;
+    float body_ay;
+    float body_az;
     float ax;
     float ay;
     float az;
@@ -379,76 +648,88 @@ static void Position_Update(void)
     if (IMU_Read() != 0)
         return;
 
-    /*
-     * No new accelerometer sample.
-     */
     if (imu_sample_count == old_sample)
         return;
 
     now_us = __HAL_TIM_GET_COUNTER(&htim2);
 
-    /*
-     * Unsigned subtraction handles TIM2 wrap-around.
-     */
+    /* Unsigned subtraction handles TIM2 wrap-around. */
     elapsed_us = now_us - previous_time_us;
     previous_time_us = now_us;
 
     dt = ((float)elapsed_us) * 0.000001f;
 
-    /*
-     * Reject unreasonable timing gaps caused by breakpoints etc.
-     */
+    /* Reject timing gaps caused by breakpoints or temporary stalls. */
     if ((dt <= 0.0f) || (dt > 0.05f))
         return;
 
     /*
-     * Remove initial stationary acceleration.
-     * For a fixed-orientation experiment, this also removes gravity.
+     * Remove the SFLP gravity estimate in the sensor frame. Unlike the old
+     * reset-time offset, this vector follows the IMU when it is tilted.
      */
-    ax = acc_x_ms2 - accel_zero_x;
-    ay = acc_y_ms2 - accel_zero_y;
-    az = acc_z_ms2 - accel_zero_z;
-
+    body_ax = acc_x_ms2 - gravity_x_ms2 - accel_bias_body_x;
+    body_ay = acc_y_ms2 - gravity_y_ms2 - accel_bias_body_y;
+    body_az = acc_z_ms2 - gravity_z_ms2 - accel_bias_body_z;
 
     /*
-     * Simple stationary detector.
+     * Rotate linear acceleration into the frame that existed at reset so
+     * velocity and position axes do not rotate with the board.
      */
-    if ((ax > -0.08f) && (ax < 0.08f) &&
-        (ay > -0.08f) && (ay < 0.08f) &&
-        (az > -0.08f) && (az < 0.08f) &&
-
-        (gyro_x_dps > -1.5f) && (gyro_x_dps < 1.5f) &&
-        (gyro_y_dps > -1.5f) && (gyro_y_dps < 1.5f) &&
-        (gyro_z_dps > -1.5f) && (gyro_z_dps < 1.5f))
+    if (Body_To_Initial_Frame(body_ax,
+                              body_ay,
+                              body_az,
+                              &ax,
+                              &ay,
+                              &az) != 0)
     {
-        /*
-         * Zero-velocity update.
-         */
-        velocity_x_ms = 0.0f;
-        velocity_y_ms = 0.0f;
-        velocity_z_ms = 0.0f;
+        return;
+    }
+
+    linear_acc_x_ms2 = ax;
+    linear_acc_y_ms2 = ay;
+    linear_acc_z_ms2 = az;
+
+    if (Is_Stationary(ax, ay, az))
+    {
+        if (stationary_sample_count < STATIONARY_DWELL_SAMPLES)
+            stationary_sample_count++;
+
+        if (stationary_sample_count >= STATIONARY_DWELL_SAMPLES)
+        {
+            /*
+             * Zero-velocity update. This bounds drift whenever the IMU is
+             * placed still, independent of its orientation.
+             */
+            velocity_x_ms = 0.0f;
+            velocity_y_ms = 0.0f;
+            velocity_z_ms = 0.0f;
+
+            linear_acc_x_ms2 = 0.0f;
+            linear_acc_y_ms2 = 0.0f;
+            linear_acc_z_ms2 = 0.0f;
+            return;
+        }
     }
     else
     {
-        /*
-         * Integrate acceleration -> position and velocity.
-         */
-        position_x_m +=
-            velocity_x_ms * dt +
-            0.5f * ax * dt * dt;
-
-        position_y_m +=
-            velocity_y_ms * dt +
-            0.5f * ay * dt * dt;
-
-        position_z_m +=
-            velocity_z_ms * dt +
-            0.5f * az * dt * dt;
-
-        velocity_x_ms += ax * dt;
-        velocity_y_ms += ay * dt;
-        velocity_z_ms += az * dt;
+        stationary_sample_count = 0U;
     }
+
+    position_x_m +=
+        velocity_x_ms * dt +
+        0.5f * ax * dt * dt;
+
+    position_y_m +=
+        velocity_y_ms * dt +
+        0.5f * ay * dt * dt;
+
+    position_z_m +=
+        velocity_z_ms * dt +
+        0.5f * az * dt * dt;
+
+    velocity_x_ms += ax * dt;
+    velocity_y_ms += ay * dt;
+    velocity_z_ms += az * dt;
 }
 /* USER CODE END 0 */
 
@@ -497,15 +778,16 @@ int main(void)
   {
       while (1)
       {
+          HAL_Delay(100);
       }
   }
 
-  IMU_Calibrate();
-
   /*
-   * If initialization failed, stay here so we can inspect
-   * imu_status and imu_whoami using the debugger.
+   * Keep the IMU completely still during calibration. The SFLP also uses
+   * this interval to converge its internal gyroscope-bias estimate.
    */
+  imu_status = IMU_Calibrate();
+
   if (imu_status != 0)
   {
       while (1)
@@ -514,7 +796,7 @@ int main(void)
       }
   }
 
-  /* USER CODE END 2 */
+/* USER CODE END 2 */
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
