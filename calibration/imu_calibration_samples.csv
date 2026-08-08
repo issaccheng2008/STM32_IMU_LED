@@ -1,0 +1,3 @@
+# This file is replaced by a completed debugger-hosted calibration session.
+# Keep the collected version so the ellipsoid fit can be rerun without moving the board again.
+index,low_g_x_mg,low_g_y_mg,low_g_z_mg,high_g_x_mg,high_g_y_mg,high_g_z_mg

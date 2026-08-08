@@ -21,6 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "imu_calibration.h"
+#include "imu_calibration_session.h"
 #include "lsm6dsv320x_reg.h"
 /* USER CODE END Includes */
 
@@ -72,6 +74,12 @@ volatile float imu_accel_x_mg = 0.0f;
 volatile float imu_accel_y_mg = 0.0f;
 /** Low-g Z-axis acceleration in milligravity (mg), configured for +/-4 g. */
 volatile float imu_accel_z_mg = 0.0f;
+/** Calibrated low-g X-axis acceleration in milligravity (mg). */
+volatile float imu_accel_x_calibrated_mg = 0.0f;
+/** Calibrated low-g Y-axis acceleration in milligravity (mg). */
+volatile float imu_accel_y_calibrated_mg = 0.0f;
+/** Calibrated low-g Z-axis acceleration in milligravity (mg). */
+volatile float imu_accel_z_calibrated_mg = 0.0f;
 
 /** Gyroscope X-axis register value (raw signed counts). */
 volatile int16_t imu_gyro_x_raw = 0;
@@ -85,6 +93,12 @@ volatile float imu_gyro_x_dps = 0.0f;
 volatile float imu_gyro_y_dps = 0.0f;
 /** Z-axis angular rate in degrees per second, configured for +/-500 dps. */
 volatile float imu_gyro_z_dps = 0.0f;
+/** Calibrated X-axis angular rate in degrees per second. */
+volatile float imu_gyro_x_calibrated_dps = 0.0f;
+/** Calibrated Y-axis angular rate in degrees per second. */
+volatile float imu_gyro_y_calibrated_dps = 0.0f;
+/** Calibrated Z-axis angular rate in degrees per second. */
+volatile float imu_gyro_z_calibrated_dps = 0.0f;
 
 /** High-g accelerometer X-axis register value (raw signed counts). */
 volatile int16_t imu_high_g_x_raw = 0;
@@ -98,11 +112,24 @@ volatile float imu_high_g_x_mg = 0.0f;
 volatile float imu_high_g_y_mg = 0.0f;
 /** High-g Z-axis acceleration in milligravity (mg), configured for +/-32 g. */
 volatile float imu_high_g_z_mg = 0.0f;
+/** Calibrated high-g X-axis acceleration in milligravity (mg). */
+volatile float imu_high_g_x_calibrated_mg = 0.0f;
+/** Calibrated high-g Y-axis acceleration in milligravity (mg). */
+volatile float imu_high_g_y_calibrated_mg = 0.0f;
+/** Calibrated high-g Z-axis acceleration in milligravity (mg). */
+volatile float imu_high_g_z_calibrated_mg = 0.0f;
 
 /** Temperature output register value (raw signed counts). */
 volatile int16_t imu_temperature_raw = 0;
 /** IMU die temperature in degrees Celsius. */
 volatile float imu_temperature_c = 0.0f;
+
+/**
+ * Set this to 1 in Live Expressions while stopped at main() to collect a new
+ * calibration.  It defaults to 0 so normal boots immediately use the constants
+ * compiled into imu_calibration.c.
+ */
+volatile uint8_t imu_run_calibration_on_boot = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -114,6 +141,7 @@ static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 static int32_t IMU_Init(void);
 static int32_t IMU_ReadAll(void);
+static int32_t IMU_ReadSensors(imu_calibration_measurement_t *measurement);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -222,12 +250,15 @@ static int32_t IMU_Init(void)
   return 0;
 }
 
-static int32_t IMU_ReadAll(void)
+static int32_t IMU_ReadSensors(imu_calibration_measurement_t *measurement)
 {
   lsm6dsv320x_data_ready_t data_ready = {0};
   int16_t raw_axes[3];
   int16_t raw_temperature;
   uint8_t updated = 0U;
+
+  if (measurement != NULL)
+    *measurement = (imu_calibration_measurement_t){0};
 
   if (lsm6dsv320x_flag_data_ready_get(&imu_ctx, &data_ready) != 0)
     return -20;
@@ -243,6 +274,22 @@ static int32_t IMU_ReadAll(void)
     imu_accel_x_mg = lsm6dsv320x_from_fs4_to_mg(raw_axes[0]);
     imu_accel_y_mg = lsm6dsv320x_from_fs4_to_mg(raw_axes[1]);
     imu_accel_z_mg = lsm6dsv320x_from_fs4_to_mg(raw_axes[2]);
+    {
+      const imu_vector3_t raw_mg = {
+          imu_accel_x_mg, imu_accel_y_mg, imu_accel_z_mg};
+      imu_vector3_t calibrated_mg;
+
+      IMU_AccelApplyCalibration(&imu_low_g_calibration,
+                                &raw_mg, &calibrated_mg);
+      imu_accel_x_calibrated_mg = calibrated_mg.x;
+      imu_accel_y_calibrated_mg = calibrated_mg.y;
+      imu_accel_z_calibrated_mg = calibrated_mg.z;
+      if (measurement != NULL)
+      {
+        measurement->low_g_mg = raw_mg;
+        measurement->ready_mask |= IMU_SAMPLE_LOW_G_READY;
+      }
+    }
     updated = 1U;
   }
 
@@ -257,6 +304,22 @@ static int32_t IMU_ReadAll(void)
     imu_gyro_x_dps = lsm6dsv320x_from_fs500_to_mdps(raw_axes[0]) / 1000.0f;
     imu_gyro_y_dps = lsm6dsv320x_from_fs500_to_mdps(raw_axes[1]) / 1000.0f;
     imu_gyro_z_dps = lsm6dsv320x_from_fs500_to_mdps(raw_axes[2]) / 1000.0f;
+    {
+      const imu_vector3_t raw_dps = {
+          imu_gyro_x_dps, imu_gyro_y_dps, imu_gyro_z_dps};
+      imu_vector3_t calibrated_dps;
+
+      IMU_GyroApplyCalibration(&imu_gyro_calibration,
+                               &raw_dps, &calibrated_dps);
+      imu_gyro_x_calibrated_dps = calibrated_dps.x;
+      imu_gyro_y_calibrated_dps = calibrated_dps.y;
+      imu_gyro_z_calibrated_dps = calibrated_dps.z;
+      if (measurement != NULL)
+      {
+        measurement->gyro_dps = raw_dps;
+        measurement->ready_mask |= IMU_SAMPLE_GYRO_READY;
+      }
+    }
     updated = 1U;
   }
 
@@ -271,6 +334,22 @@ static int32_t IMU_ReadAll(void)
     imu_high_g_x_mg = lsm6dsv320x_from_fs32_to_mg(raw_axes[0]);
     imu_high_g_y_mg = lsm6dsv320x_from_fs32_to_mg(raw_axes[1]);
     imu_high_g_z_mg = lsm6dsv320x_from_fs32_to_mg(raw_axes[2]);
+    {
+      const imu_vector3_t raw_mg = {
+          imu_high_g_x_mg, imu_high_g_y_mg, imu_high_g_z_mg};
+      imu_vector3_t calibrated_mg;
+
+      IMU_AccelApplyCalibration(&imu_high_g_calibration,
+                                &raw_mg, &calibrated_mg);
+      imu_high_g_x_calibrated_mg = calibrated_mg.x;
+      imu_high_g_y_calibrated_mg = calibrated_mg.y;
+      imu_high_g_z_calibrated_mg = calibrated_mg.z;
+      if (measurement != NULL)
+      {
+        measurement->high_g_mg = raw_mg;
+        measurement->ready_mask |= IMU_SAMPLE_HIGH_G_READY;
+      }
+    }
     updated = 1U;
   }
 
@@ -288,6 +367,11 @@ static int32_t IMU_ReadAll(void)
     imu_sample_count++;
 
   return 0;
+}
+
+static int32_t IMU_ReadAll(void)
+{
+  return IMU_ReadSensors(NULL);
 }
 /* USER CODE END 0 */
 
@@ -331,6 +415,17 @@ int main(void)
   /* Stop here on initialization failure so imu_status stays visible. */
   if (imu_status != 0)
   {
+    while (1)
+    {
+      HAL_Delay(100U);
+    }
+  }
+
+  if (imu_run_calibration_on_boot != 0U)
+  {
+    imu_status = IMU_RunCalibrationSession(IMU_ReadSensors, HAL_Delay);
+
+    /* Keep the generated constants and status available in Live Expressions. */
     while (1)
     {
       HAL_Delay(100U);
