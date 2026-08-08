@@ -142,6 +142,9 @@ static void MX_TIM2_Init(void);
 static int32_t IMU_Init(void);
 static int32_t IMU_ReadAll(void);
 static int32_t IMU_ReadSensors(imu_calibration_measurement_t *measurement);
+#if defined(DEBUG)
+extern void initialise_monitor_handles(void);
+#endif
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -423,6 +426,10 @@ int main(void)
 
   if (imu_run_calibration_on_boot != 0U)
   {
+#if defined(DEBUG)
+    /* AN4989 section 7.4.3: connect newlib to the debugger via librdimon. */
+    initialise_monitor_handles();
+#endif
     imu_status = IMU_RunCalibrationSession(IMU_ReadSensors, HAL_Delay);
 
     /* Keep the generated constants and status available in Live Expressions. */
