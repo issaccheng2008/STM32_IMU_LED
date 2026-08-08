@@ -14,39 +14,73 @@
  * by the calibration session for this specific board.
  */
 const imu_accel_calibration_t imu_low_g_calibration = {
-    .offset_x_mg = 0.0f,
-    .offset_y_mg = 0.0f,
-    .offset_z_mg = 0.0f,
-    .x_gain = 1.0f,
-    .y_to_x = 0.0f,
-    .z_to_x = 0.0f,
-    .x_to_y = 0.0f,
-    .y_gain = 1.0f,
-    .z_to_y = 0.0f,
-    .x_to_z = 0.0f,
-    .y_to_z = 0.0f,
-    .z_gain = 1.0f,
+
+    .offset_x_mg = 5.322172165f,
+
+    .offset_y_mg = -2.903429270f,
+
+    .offset_z_mg = 0.631744325f,
+
+    .x_gain = 1.001965523f,
+
+    .y_to_x = -0.000204782f,
+
+    .z_to_x = -0.002462042f,
+
+    .x_to_y = -0.000204782f,
+
+    .y_gain = 1.002861500f,
+
+    .z_to_y = 0.000589513f,
+
+    .x_to_z = -0.002462042f,
+
+    .y_to_z = 0.000589513f,
+
+    .z_gain = 1.002964139f,
+
 };
+
+
 
 const imu_accel_calibration_t imu_high_g_calibration = {
-    .offset_x_mg = 0.0f,
-    .offset_y_mg = 0.0f,
-    .offset_z_mg = 0.0f,
-    .x_gain = 1.0f,
-    .y_to_x = 0.0f,
-    .z_to_x = 0.0f,
-    .x_to_y = 0.0f,
-    .y_gain = 1.0f,
-    .z_to_y = 0.0f,
-    .x_to_z = 0.0f,
-    .y_to_z = 0.0f,
-    .z_gain = 1.0f,
+
+    .offset_x_mg = -13.582240105f,
+
+    .offset_y_mg = -83.434211731f,
+
+    .offset_z_mg = -115.198829651f,
+
+    .x_gain = 1.015766501f,
+
+    .y_to_x = 0.001997343f,
+
+    .z_to_x = -0.006946585f,
+
+    .x_to_y = 0.001997343f,
+
+    .y_gain = 1.001134515f,
+
+    .z_to_y = -0.001752639f,
+
+    .x_to_z = -0.006946585f,
+
+    .y_to_z = -0.001752639f,
+
+    .z_gain = 1.027934432f,
+
 };
 
+
+
 const imu_gyro_calibration_t imu_gyro_calibration = {
-    .gyro_offset_x = 0.0f,
-    .gyro_offset_y = 0.0f,
-    .gyro_offset_z = 0.0f,
+
+    .gyro_offset_x = 0.072683334f,
+
+    .gyro_offset_y = -0.015327083f,
+
+    .gyro_offset_z = -0.247216672f,
+
 };
 
 static int32_t solve_linear_9(double matrix[IMU_ELLIPSOID_PARAMETER_COUNT]

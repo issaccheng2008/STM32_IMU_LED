@@ -234,20 +234,71 @@ static int32_t IMU_Init(void)
   if (lsm6dsv320x_hg_xl_full_scale_set(&imu_ctx, LSM6DSV320X_32g) != 0)
     return -7;
 
+  /* Low-g accelerometer: 480 samples/second, high-performance mode. */
   if (lsm6dsv320x_xl_setup(&imu_ctx,
-                           LSM6DSV320X_ODR_AT_120Hz,
+                           LSM6DSV320X_ODR_AT_480Hz,
                            LSM6DSV320X_XL_HIGH_PERFORMANCE_MD) != 0)
+  {
     return -8;
+  }
 
+  /* Gyroscope: 480 samples/second, high-performance mode. */
   if (lsm6dsv320x_gy_setup(&imu_ctx,
-                           LSM6DSV320X_ODR_AT_120Hz,
+                           LSM6DSV320X_ODR_AT_480Hz,
                            LSM6DSV320X_GY_HIGH_PERFORMANCE_MD) != 0)
+  {
     return -9;
+  }
 
-  if (lsm6dsv320x_hg_xl_data_rate_set(&imu_ctx,
-                                      LSM6DSV320X_HG_XL_ODR_AT_480Hz,
-                                      PROPERTY_ENABLE) != 0)
+  /* High-g accelerometer: keep at 480 samples/second. */
+  if (lsm6dsv320x_hg_xl_data_rate_set(
+          &imu_ctx,
+          LSM6DSV320X_HG_XL_ODR_AT_480Hz,
+          PROPERTY_ENABLE) != 0)
+  {
     return -10;
+  }
+
+  /*
+   * Low-g accelerometer output path:
+   * LPF1 -> LPF2 -> output registers
+   *
+   * XL_LIGHT means LPF2 bandwidth = ODR / 20.
+   * At 480 Hz, cutoff is approximately 24 Hz.
+   */
+  if (lsm6dsv320x_filt_xl_setup(
+          &imu_ctx,
+          LSM6DSV320X_XL_FILT_LP_LPF2,
+          LSM6DSV320X_XL_MEDIUM,
+          0U) != 0)
+  {
+    return -11;
+  }
+
+  /*
+   * Gyroscope LPF1.
+   * At a 480 Hz ODR, GY_VERY_STRONG gives approximately 56.7 Hz
+   * overall gyro bandwidth.
+   */
+  if (lsm6dsv320x_filt_gy_lp1_bandwidth_set(
+          &imu_ctx,
+          LSM6DSV320X_GY_VERY_STRONG) != 0)
+  {
+    return -12;
+  }
+
+  if (lsm6dsv320x_filt_gy_lp1_set(
+          &imu_ctx,
+          PROPERTY_ENABLE) != 0)
+  {
+    return -13;
+  }
+
+  /*
+   * Allow the gyro and accelerometer filters to settle.
+   * This delay is appropriate for the particular settings above.
+   */
+  HAL_Delay(150U);
 
   HAL_Delay(50U);
   return 0;
