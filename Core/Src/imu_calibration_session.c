@@ -2,13 +2,8 @@
 
 #include <math.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
-
-#define SEMIHOST_SYS_OPEN 0x01U
-#define SEMIHOST_SYS_CLOSE 0x02U
-#define SEMIHOST_SYS_WRITE0 0x04U
-#define SEMIHOST_SYS_WRITE 0x05U
-#define SEMIHOST_OPEN_WRITE_TEXT 4U
 
 #define CALIBRATION_POLL_DELAY_MS 1U
 #define CALIBRATION_MAX_IDLE_POLLS 30000U
@@ -26,64 +21,31 @@ volatile imu_accel_calibration_t imu_calibration_last_low_g = {0};
 volatile imu_accel_calibration_t imu_calibration_last_high_g = {0};
 volatile imu_gyro_calibration_t imu_calibration_last_gyro = {0};
 
-static int32_t semihost_call(uint32_t operation, const void *parameter)
-{
-#if defined(__arm__) || defined(__thumb__)
-  register uint32_t register_r0 __asm("r0") = operation;
-  register const void *register_r1 __asm("r1") = parameter;
-
-  __asm volatile("bkpt 0xAB"
-                 : "+r"(register_r0)
-                 : "r"(register_r1)
-                 : "memory");
-  return (int32_t)register_r0;
-#else
-  (void)operation;
-  (void)parameter;
-  return -1;
-#endif
-}
-
 static void debug_write(const char *text)
 {
-  (void)semihost_call(SEMIHOST_SYS_WRITE0, text);
+  (void)fputs(text, stdout);
+  (void)fflush(stdout);
 }
 
-static int32_t sample_file_open(const char *name, uint32_t name_length)
+static FILE *sample_file_open(const char *name)
 {
-  struct
-  {
-    const char *name;
-    uint32_t mode;
-    uint32_t name_length;
-  } arguments;
-
-  arguments.name = name;
-  arguments.mode = SEMIHOST_OPEN_WRITE_TEXT;
-  arguments.name_length = name_length;
-  return semihost_call(SEMIHOST_SYS_OPEN, &arguments);
+  return fopen(name, "w");
 }
 
-static int32_t sample_file_write(int32_t handle,
+static int32_t sample_file_write(FILE *file,
                                  const char *text,
                                  uint32_t length)
 {
-  struct
-  {
-    int32_t handle;
-    const char *buffer;
-    uint32_t length;
-  } arguments;
+  if (fwrite(text, 1U, length, file) != length)
+    return -1;
 
-  arguments.handle = handle;
-  arguments.buffer = text;
-  arguments.length = length;
-  return semihost_call(SEMIHOST_SYS_WRITE, &arguments);
+  /* Preserve every accepted point if the debug session is interrupted. */
+  return (fflush(file) == 0) ? 0 : -1;
 }
 
-static void sample_file_close(int32_t handle)
+static void sample_file_close(FILE *file)
 {
-  (void)semihost_call(SEMIHOST_SYS_CLOSE, &handle);
+  (void)fclose(file);
 }
 
 static void text_reset(calibration_text_t *output)
@@ -403,7 +365,7 @@ int32_t IMU_RunCalibrationSession(imu_calibration_read_fn_t read_measurement,
   imu_gyro_calibration_t gyro_fit;
   float low_g_rms = 0.0f;
   float high_g_rms = 0.0f;
-  int32_t sample_file;
+  FILE *sample_file;
   const char *sample_file_path = IMU_CALIBRATION_SAMPLE_FILE;
   calibration_text_t output;
   int32_t status = 0;
@@ -417,17 +379,13 @@ int32_t IMU_RunCalibrationSession(imu_calibration_read_fn_t read_measurement,
               "Keep the board completely stationary during each capture.\r\n"
               "Move it to a new orientation only after a point is accepted.\r\n");
 
-  sample_file = sample_file_open(
-      IMU_CALIBRATION_SAMPLE_FILE,
-      (uint32_t)(sizeof(IMU_CALIBRATION_SAMPLE_FILE) - 1U));
-  if (sample_file < 0)
+  sample_file = sample_file_open(IMU_CALIBRATION_SAMPLE_FILE);
+  if (sample_file == NULL)
   {
     sample_file_path = IMU_CALIBRATION_SAMPLE_FILE_FALLBACK;
-    sample_file = sample_file_open(
-        IMU_CALIBRATION_SAMPLE_FILE_FALLBACK,
-        (uint32_t)(sizeof(IMU_CALIBRATION_SAMPLE_FILE_FALLBACK) - 1U));
+    sample_file = sample_file_open(IMU_CALIBRATION_SAMPLE_FILE_FALLBACK);
   }
-  if (sample_file < 0)
+  if (sample_file == NULL)
   {
     debug_write("WARNING: Could not open a CSV sample file. The fit will "
                 "continue, but points will not be saved.\r\n");
@@ -475,7 +433,7 @@ int32_t IMU_RunCalibrationSession(imu_calibration_read_fn_t read_measurement,
     build_csv_point(&output, orientation + 1U,
                     &low_g_points[orientation],
                     &high_g_points[orientation]);
-    if (sample_file >= 0)
+    if (sample_file != NULL)
       (void)sample_file_write(sample_file, output.text, output.length);
 
     text_reset(&output);
@@ -510,7 +468,7 @@ int32_t IMU_RunCalibrationSession(imu_calibration_read_fn_t read_measurement,
   if (status != 0)
     goto session_finished;
 
-  if (sample_file >= 0)
+  if (sample_file != NULL)
   {
     text_reset(&output);
     text_append(&output, "# gyro_offset_dps,");
@@ -533,7 +491,7 @@ int32_t IMU_RunCalibrationSession(imu_calibration_read_fn_t read_measurement,
   text_append(&output, " mg, high-g = ");
   text_append_fixed(&output, high_g_rms, 3U);
   text_append(&output, " mg.\r\n");
-  if (sample_file >= 0)
+  if (sample_file != NULL)
   {
     text_append(&output, "Saved averaged points to ");
     text_append(&output, sample_file_path);
@@ -553,7 +511,7 @@ int32_t IMU_RunCalibrationSession(imu_calibration_read_fn_t read_measurement,
   status = 0;
 
 session_finished:
-  if (sample_file >= 0)
+  if (sample_file != NULL)
     sample_file_close(sample_file);
 
   if (status != 0)

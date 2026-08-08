@@ -7,20 +7,52 @@ zero-rate offset calibration only.
 
 ## Collect calibration data in CubeIDE
 
-1. Build the **Debug** configuration and start `LED-test Debug` with the
-   ST-Link/V2. The committed launch configuration enables semihosting and uses
-   the project directory as its working directory.
-2. When the debugger stops at `main`, add `imu_run_calibration_on_boot` to Live
-   Expressions and set it to `1` before resuming.
-3. Follow the debugger-console prompts. For every orientation, place the board
+This setup follows section 7.4.3 of ST AN4989, *Introduction to debug toolbox
+for STM32 MCUs*. Semihosting is enabled through OpenOCD, not through the
+ST-LINK GDB server's **Enable semihosting** list.
+
+1. In **Project -> Properties -> C/C++ Build -> Settings -> Tool Settings**,
+   select the **Debug** configuration and verify these settings (they are
+   committed in `.cproject`):
+   - **MCU GCC Linker -> Libraries** contains `rdimon`.
+   - **MCU GCC Linker -> Miscellaneous** contains `-specs=rdimon.specs`.
+   - **C/C++ General -> Paths and Symbols -> Source Location -> Core -> Filter**
+     excludes `Src/syscalls.c` for Debug.
+2. Run **Project -> Clean**, then build the **Debug** configuration. This is
+   required after importing the changed linker settings.
+3. Open **Run -> Debug Configurations** and select
+   `LED-test Semihosting Debug`. On its **Debugger** tab, verify:
+   - **Debug probe:** `ST-LINK (OpenOCD)`
+   - **Interface:** `SWD`
+   - **Reset mode:** `Software system reset`
+   The configuration uses the committed `LED-test Semihosting Debug.cfg` for
+   the STM32H743VITx and an external ST-Link/V2.
+4. On the **Startup** tab, verify that **Initialization Commands** contains:
+
+   ```text
+   monitor arm semihosting enable
+   ```
+
+5. Click **Debug**. When execution stops at `main`, add
+   `imu_run_calibration_on_boot` to Live Expressions and set it to `1` before
+   resuming. `initialise_monitor_handles()` runs only when calibration was
+   requested, immediately before the first console/file operation.
+6. Open **Window -> Show View -> Console** and select the console named for
+   `LED-test Semihosting Debug`. Press **Resume (F8)**.
+7. Follow the debugger-console prompts. For every orientation, place the board
    at a different angle, take your hands off it, and wait for the `3, 2, 1`
    countdown. The firmware averages 256 fresh samples from each accelerometer.
    Captures with more than 12 mg low-g RMS movement/noise are repeated.
-4. Distribute the 40 orientations over the full sphere. Include each face,
+8. Distribute the 40 orientations over the full sphere. Include each face,
    edge, and corner direction rather than collecting many nearly identical
    points.
-5. After both ellipsoids are fitted, leave the board still through the 10-second
+9. After both ellipsoids are fitted, leave the board still through the 10-second
    gyro countdown and collection of 1200 fresh gyro samples.
+
+Do not use `LED-test Debug` for calibration. It remains a normal ST-LINK GDB
+server launch with semihosting disabled. The **Enable terminal mode** and
+**Enable terminal and File I/O mode** choices shown for that server are not the
+AN4989 section 7.4.3 OpenOCD procedure.
 
 The session writes every accepted pair of averaged accelerometer points and the
 gyro mean to `calibration/imu_calibration_samples.csv`. It also prints three
@@ -28,9 +60,15 @@ paste-ready initializers. Replace the matching identity/zero definitions near
 the top of `Core/Src/imu_calibration.c`, rebuild, and leave
 `imu_run_calibration_on_boot` at its normal value of `0`.
 
-If CubeIDE ignores the launch working directory, the firmware falls back to
-`imu_calibration_samples.csv` in the debugger server's current directory and
-prints that filename in the console.
+The firmware uses the standard newlib/`librdimon` `fopen`, `fwrite`, and
+`fclose` path. If OpenOCD cannot open the `calibration` subdirectory from its
+working directory, the firmware falls back to `imu_calibration_samples.csv` in
+OpenOCD's current directory and prints that filename in the console. Refresh
+the CubeIDE project with **F5** after collection to show the updated file.
+
+Keep the debugger attached for the entire session. Semihosting uses breakpoint
+instructions; executing a semihosted C library call without a debugger can stop
+or fault the target, and the debugger significantly slows each I/O operation.
 
 The normal polling loop then exposes both raw physical readings and these
 calibrated values in Live Expressions:
