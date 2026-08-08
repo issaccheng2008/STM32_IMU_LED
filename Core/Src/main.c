@@ -427,7 +427,7 @@ int main(void)
   if (imu_run_calibration_on_boot != 0U)
   {
 #if defined(DEBUG)
-    /* AN4989 section 7.4.3: connect newlib to the debugger via librdimon. */
+    /* Connect standard printf/fopen calls to the debugger via librdimon. */
     initialise_monitor_handles();
 #endif
     imu_status = IMU_RunCalibrationSession(IMU_ReadSensors, HAL_Delay);
