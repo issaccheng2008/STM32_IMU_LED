@@ -23,7 +23,8 @@ volatile imu_gyro_calibration_t imu_calibration_last_gyro = {0};
 
 static void debug_write(const char *text)
 {
-  (void)fputs(text, stdout);
+  /* stdout is routed to CubeIDE by librdimon semihosting in Debug builds. */
+  (void)printf("%s", text);
   (void)fflush(stdout);
 }
 
