@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include "imu_calibration.h"
 #include "imu_calibration_session.h"
+#include "imu_orientation.h"
 #include "lsm6dsv320x_reg.h"
 /* USER CODE END Includes */
 
@@ -33,7 +34,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define IMU_OUTPUT_DATA_RATE_HZ 480.0f
+#define IMU_ORIENTATION_TIMER_SECONDS_PER_TICK 1.0e-6f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -49,6 +51,9 @@ TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
 static stmdev_ctx_t imu_ctx;
+static uint8_t imu_orientation_pending_mask = 0U;
+static uint8_t imu_orientation_timestamp_valid = 0U;
+static uint32_t imu_orientation_last_timestamp_us = 0U;
 
 /** Last IMU initialization or read result: 0 means success. */
 volatile int32_t imu_status = -1;
@@ -425,7 +430,46 @@ static int32_t IMU_ReadSensors(imu_calibration_measurement_t *measurement)
 
 static int32_t IMU_ReadAll(void)
 {
-  return IMU_ReadSensors(NULL);
+  imu_calibration_measurement_t measurement;
+  int32_t status;
+
+  status = IMU_ReadSensors(&measurement);
+  if (status != 0)
+    return status;
+
+  imu_orientation_pending_mask |=
+      measurement.ready_mask &
+      (IMU_SAMPLE_LOW_G_READY | IMU_SAMPLE_GYRO_READY);
+
+  if ((imu_orientation_pending_mask &
+       (IMU_SAMPLE_LOW_G_READY | IMU_SAMPLE_GYRO_READY)) ==
+      (IMU_SAMPLE_LOW_G_READY | IMU_SAMPLE_GYRO_READY))
+  {
+    const uint32_t timestamp_us = __HAL_TIM_GET_COUNTER(&htim2);
+    float sample_period_s = 1.0f / IMU_OUTPUT_DATA_RATE_HZ;
+
+    if (imu_orientation_timestamp_valid != 0U)
+    {
+      /* Unsigned subtraction also handles the 32-bit timer wrapping. */
+      sample_period_s =
+          (float)(timestamp_us - imu_orientation_last_timestamp_us) *
+          IMU_ORIENTATION_TIMER_SECONDS_PER_TICK;
+    }
+
+    imu_orientation_last_timestamp_us = timestamp_us;
+    imu_orientation_timestamp_valid = 1U;
+    imu_orientation_pending_mask = 0U;
+
+    IMU_OrientationUpdate(imu_gyro_x_calibrated_dps,
+                          imu_gyro_y_calibrated_dps,
+                          imu_gyro_z_calibrated_dps,
+                          imu_accel_x_calibrated_mg,
+                          imu_accel_y_calibrated_mg,
+                          imu_accel_z_calibrated_mg,
+                          sample_period_s);
+  }
+
+  return 0;
 }
 /* USER CODE END 0 */
 
@@ -474,6 +518,17 @@ int main(void)
       HAL_Delay(100U);
     }
   }
+
+  if (HAL_TIM_Base_Start(&htim2) != HAL_OK)
+  {
+    imu_status = -30;
+    while (1)
+    {
+      HAL_Delay(100U);
+    }
+  }
+
+  IMU_OrientationInitialise(IMU_OUTPUT_DATA_RATE_HZ);
 
   if (imu_run_calibration_on_boot != 0U)
   {
