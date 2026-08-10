@@ -30,6 +30,10 @@
 #include "wand_storage.h"
 
 #include <math.h>
+#if defined(DEBUG)
+#include "ff.h"
+#include <stdio.h>
+#endif
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -41,6 +45,7 @@
 /* USER CODE BEGIN PD */
 #define IMU_OUTPUT_DATA_RATE_HZ 1920.0f
 #define IMU_ORIENTATION_TIMER_SECONDS_PER_TICK 1.0e-6f
+#define WAND_DEBUG_STATUS_PERIOD_MS 1000U
 
 #if (WAND1_LED_COUNT != SK9822_LED_COUNT) || \
     (WAND1_SK9822_FRAME_BYTES != SK9822_FRAME_BYTES)
@@ -90,8 +95,25 @@ volatile float wand_angle_deg = 0.0f;
 volatile uint32_t wand_sample_index = 0U;
 /** Number of new SK9822 frames sent by the playback loop. */
 volatile uint32_t wand_frame_update_count = 0U;
+/** Number of SK9822 transmissions attempted, including the boot self-test. */
+volatile uint32_t wand_frame_attempt_count = 0U;
+/** Number of SK9822 transmissions that returned a non-HAL_OK result. */
+volatile uint32_t wand_spi_error_count = 0U;
 /** Most recent HAL SPI result returned while updating the strip. */
 volatile int32_t wand_spi_status = HAL_OK;
+/** Detailed HAL SPI error flags for the most recent transmission. */
+volatile uint32_t wand_spi_hal_error = HAL_SPI_ERROR_NONE;
+
+#if defined(DEBUG)
+/** Number of LEDs with nonzero RGB data in the currently selected frame. */
+volatile uint32_t wand_selected_lit_led_count = 0U;
+/** Set to zero in Live Expressions to stop the one-line-per-second output. */
+volatile uint8_t wand_debug_periodic_output_enabled = 1U;
+/** Set to zero at the main() breakpoint to skip the RGB boot self-test. */
+volatile uint8_t wand_debug_led_self_test_on_boot = 1U;
+static uint8_t wand_debug_console_ready = 0U;
+static const char *wand_debug_boot_stage = "reset";
+#endif
 
 /** Last IMU initialization or read result: 0 means success. */
 volatile int32_t imu_status = -1;
@@ -188,7 +210,12 @@ static int32_t IMU_Init(void);
 static int32_t IMU_ReadAll(void);
 static int32_t IMU_ReadSensors(imu_calibration_measurement_t *measurement);
 static void WAND_PlayCurrentAngle(void);
+static HAL_StatusTypeDef WAND_TransmitTracked(const uint8_t *frame);
 #if defined(DEBUG)
+static uint32_t WAND_CountLitLeds(const uint8_t *frame);
+static void WAND_DebugPrintStorageStatus(void);
+static void WAND_DebugRunLedSelfTest(void);
+static void WAND_DebugPoll(void);
 extern void initialise_monitor_handles(void);
 #endif
 /* USER CODE END PFP */
@@ -500,6 +527,346 @@ static int32_t IMU_ReadAll(void)
   return 0;
 }
 
+#if defined(DEBUG)
+static uint32_t WAND_CountLitLeds(const uint8_t *frame)
+{
+  uint32_t led;
+  uint32_t lit_leds = 0U;
+
+  if (frame == NULL)
+    return 0U;
+
+  for (led = 0U; led < SK9822_LED_COUNT; led++)
+  {
+    const uint32_t offset = SK9822_START_FRAME_BYTES +
+                            led * SK9822_BYTES_PER_LED;
+    const uint8_t brightness = frame[offset] & 0x1FU;
+
+    if ((brightness != 0U) &&
+        ((frame[offset + 1U] != 0U) ||
+         (frame[offset + 2U] != 0U) ||
+         (frame[offset + 3U] != 0U)))
+    {
+      lit_leds++;
+    }
+  }
+
+  return lit_leds;
+}
+#endif
+
+static HAL_StatusTypeDef WAND_TransmitTracked(const uint8_t *frame)
+{
+  HAL_StatusTypeDef status;
+
+  wand_frame_attempt_count++;
+  status = SK9822_TransmitFrame(&hspi1, frame, SK9822_FRAME_BYTES);
+  wand_spi_status = (int32_t)status;
+  wand_spi_hal_error = HAL_SPI_GetError(&hspi1);
+  if (status != HAL_OK)
+    wand_spi_error_count++;
+
+  return status;
+}
+
+#if defined(DEBUG)
+static const char *WAND_DebugStoragePhaseName(wand_storage_phase_t phase)
+{
+  switch (phase)
+  {
+    case WAND_STORAGE_PHASE_ARGUMENT: return "argument";
+    case WAND_STORAGE_PHASE_MOUNT: return "mount";
+    case WAND_STORAGE_PHASE_OPEN: return "open";
+    case WAND_STORAGE_PHASE_HEADER_READ: return "header read";
+    case WAND_STORAGE_PHASE_HEADER_VALIDATE: return "header validation";
+    case WAND_STORAGE_PHASE_FILE_SIZE: return "file size";
+    case WAND_STORAGE_PHASE_CAPACITY: return "RAM capacity";
+    case WAND_STORAGE_PHASE_PAYLOAD_READ: return "payload read";
+    case WAND_STORAGE_PHASE_PAYLOAD_VALIDATE: return "payload validation";
+    case WAND_STORAGE_PHASE_CLOSE: return "close";
+    case WAND_STORAGE_PHASE_COMPLETE: return "complete";
+    default: return "not started";
+  }
+}
+
+static const char *WAND_DebugFatFsResultName(int32_t result)
+{
+  switch ((FRESULT)result)
+  {
+    case FR_OK: return "FR_OK";
+    case FR_DISK_ERR: return "FR_DISK_ERR";
+    case FR_INT_ERR: return "FR_INT_ERR";
+    case FR_NOT_READY: return "FR_NOT_READY";
+    case FR_NO_FILE: return "FR_NO_FILE";
+    case FR_NO_PATH: return "FR_NO_PATH";
+    case FR_INVALID_NAME: return "FR_INVALID_NAME";
+    case FR_DENIED: return "FR_DENIED";
+    case FR_EXIST: return "FR_EXIST";
+    case FR_INVALID_OBJECT: return "FR_INVALID_OBJECT";
+    case FR_WRITE_PROTECTED: return "FR_WRITE_PROTECTED";
+    case FR_INVALID_DRIVE: return "FR_INVALID_DRIVE";
+    case FR_NOT_ENABLED: return "FR_NOT_ENABLED";
+    case FR_NO_FILESYSTEM: return "FR_NO_FILESYSTEM";
+    case FR_MKFS_ABORTED: return "FR_MKFS_ABORTED";
+    case FR_TIMEOUT: return "FR_TIMEOUT";
+    case FR_LOCKED: return "FR_LOCKED";
+    case FR_NOT_ENOUGH_CORE: return "FR_NOT_ENOUGH_CORE";
+    case FR_TOO_MANY_OPEN_FILES: return "FR_TOO_MANY_OPEN_FILES";
+    case FR_INVALID_PARAMETER: return "FR_INVALID_PARAMETER";
+    default: return "unknown FRESULT";
+  }
+}
+
+static const char *WAND_DebugWandResultName(wand_result_t result)
+{
+  switch (result)
+  {
+    case WAND_OK: return "WAND_OK";
+    case WAND_ERROR_ARGUMENT: return "WAND_ERROR_ARGUMENT";
+    case WAND_ERROR_SHORT_HEADER: return "WAND_ERROR_SHORT_HEADER";
+    case WAND_ERROR_MAGIC: return "WAND_ERROR_MAGIC";
+    case WAND_ERROR_VERSION: return "WAND_ERROR_VERSION";
+    case WAND_ERROR_FORMAT: return "WAND_ERROR_FORMAT";
+    case WAND_ERROR_HEADER_CRC: return "WAND_ERROR_HEADER_CRC";
+    case WAND_ERROR_PAYLOAD_LENGTH: return "WAND_ERROR_PAYLOAD_LENGTH";
+    case WAND_ERROR_PAYLOAD_CRC: return "WAND_ERROR_PAYLOAD_CRC";
+    case WAND_ERROR_SK9822_FRAME: return "WAND_ERROR_SK9822_FRAME";
+    default: return "unknown WAND result";
+  }
+}
+
+static const char *WAND_DebugHalStatusName(int32_t status)
+{
+  switch ((HAL_StatusTypeDef)status)
+  {
+    case HAL_OK: return "HAL_OK";
+    case HAL_ERROR: return "HAL_ERROR";
+    case HAL_BUSY: return "HAL_BUSY";
+    case HAL_TIMEOUT: return "HAL_TIMEOUT";
+    default: return "unknown HAL status";
+  }
+}
+
+static void WAND_DebugPrintStorageStatus(void)
+{
+  wand_storage_diagnostics_t diagnostics;
+  uint32_t sample;
+  uint32_t lit_frames = 0U;
+  uint32_t lit_led_commands = 0U;
+
+  WAND_StorageGetDiagnostics(&diagnostics);
+  if (wand_storage_status != WAND_STORAGE_OK)
+  {
+    (void)printf(
+        "[ERROR][SD] %s load failed: status=%ld, phase=%s, "
+        "FatFs=%ld (%s), WAND=%ld (%s).\r\n",
+        WAND_STORAGE_FILENAME,
+        (long)wand_storage_status,
+        WAND_DebugStoragePhaseName(diagnostics.phase),
+        (long)diagnostics.fatfs_result,
+        WAND_DebugFatFsResultName(diagnostics.fatfs_result),
+        (long)diagnostics.wand_result,
+        WAND_DebugWandResultName(diagnostics.wand_result));
+    (void)printf(
+        "[ERROR][SD] bytes_read=%lu, file_bytes=%lu, expected=%lu.\r\n",
+        (unsigned long)diagnostics.bytes_read,
+        (unsigned long)diagnostics.file_bytes,
+        (unsigned long)diagnostics.expected_file_bytes);
+
+    if (wand_storage_status == WAND_STORAGE_ERROR_MOUNT)
+    {
+      (void)printf(
+          "[HINT][SD] Insert a FAT32 card and check PC8-PC12/PD2 plus a "
+          "common ground. FR_NO_FILESYSTEM means reformat as FAT32.\r\n");
+    }
+    else if (wand_storage_status == WAND_STORAGE_ERROR_OPEN)
+    {
+      (void)printf(
+          "[HINT][SD] Copy the binary export to the card root with the exact "
+          "8.3 name %s (not WAND.json or WAND.POV.POV).\r\n",
+          WAND_STORAGE_FILENAME);
+    }
+    else
+    {
+      (void)printf(
+          "[HINT][SD] Re-export %s from the current converter and copy it "
+          "again; the file was unreadable or failed WAND1 validation.\r\n",
+          WAND_STORAGE_FILENAME);
+    }
+    return;
+  }
+
+  for (sample = 0U; sample < wand_header.sample_count; sample++)
+  {
+    const uint8_t *frame =
+        &wand_payload[sample * wand_header.frame_bytes];
+    const uint32_t lit_leds = WAND_CountLitLeds(frame);
+
+    lit_led_commands += lit_leds;
+    if (lit_leds != 0U)
+      lit_frames++;
+  }
+
+  (void)printf(
+      "[OK][SD] %s loaded and CRC-checked: %lu bytes, %lu frames, "
+      "%u LEDs, step=%lu microdegrees.\r\n",
+      WAND_STORAGE_FILENAME,
+      (unsigned long)wand_header.file_bytes,
+      (unsigned long)wand_header.sample_count,
+      (unsigned int)wand_header.led_count,
+      (unsigned long)wand_header.angle_step_udeg);
+  (void)printf(
+      "[OK][SD] Image content: %lu/%lu frames and %lu LED commands are "
+      "non-black.\r\n",
+      (unsigned long)lit_frames,
+      (unsigned long)wand_header.sample_count,
+      (unsigned long)lit_led_commands);
+  if (lit_frames == 0U)
+  {
+    (void)printf(
+        "[WARN][SD] Every stored LED command is black or has brightness "
+        "zero; regenerate the image with visible pixels and brightness.\r\n");
+  }
+}
+
+static void WAND_DebugRunLedSelfTest(void)
+{
+  uint32_t led;
+  HAL_StatusTypeDef status;
+
+  if (wand_debug_led_self_test_on_boot == 0U)
+  {
+    (void)printf("[SKIP][LED] RGB boot self-test disabled.\r\n");
+    return;
+  }
+
+  SK9822_MakeBlankFrame(wand_blank_frame, sizeof(wand_blank_frame));
+  for (led = 0U; led < SK9822_LED_COUNT; led++)
+  {
+    const uint32_t offset = SK9822_START_FRAME_BYTES +
+                            led * SK9822_BYTES_PER_LED;
+    wand_blank_frame[offset] = 0xE1U; /* 1/31 global brightness. */
+    if (led < 12U)
+      wand_blank_frame[offset + 2U] = 0xFFU; /* Red. */
+    else if (led < 24U)
+      wand_blank_frame[offset + 1U] = 0xFFU; /* Green. */
+    else
+      wand_blank_frame[offset + 3U] = 0xFFU; /* Blue. */
+  }
+
+  (void)printf(
+      "[TEST][LED] Showing low-brightness red/green/blue segments for "
+      "1 second.\r\n");
+  status = WAND_TransmitTracked(wand_blank_frame);
+  (void)printf(
+      "[TEST][LED] SPI result=%s, HAL error=0x%08lX.\r\n",
+      WAND_DebugHalStatusName((int32_t)status),
+      (unsigned long)wand_spi_hal_error);
+  if (status == HAL_OK)
+  {
+    (void)printf(
+        "[TEST][LED] If no colors are visible now, inspect 5 V power, "
+        "common ground, strip input direction, PA5 clock, PA7 data, and "
+        "3.3 V logic compatibility.\r\n");
+  }
+  HAL_Delay(1000U);
+
+  SK9822_MakeBlankFrame(wand_blank_frame, sizeof(wand_blank_frame));
+  status = WAND_TransmitTracked(wand_blank_frame);
+  (void)printf(
+      "[%s][LED] Boot self-test ended; blank-frame result=%s.\r\n",
+      (status == HAL_OK) ? "OK" : "ERROR",
+      WAND_DebugHalStatusName((int32_t)status));
+}
+
+static void WAND_DebugPoll(void)
+{
+  static uint32_t last_tick_ms = 0U;
+  static uint32_t last_orientation_count = 0U;
+  static uint32_t last_blank_sample = UINT32_MAX;
+  const uint32_t now_ms = HAL_GetTick();
+  uint32_t elapsed_ms;
+  uint32_t orientation_delta;
+  uint32_t orientation_rate_hz;
+  int32_t roll_mdeg;
+  int32_t angle_mdeg;
+
+  if (wand_debug_periodic_output_enabled == 0U)
+    return;
+
+  if (last_tick_ms == 0U)
+  {
+    last_tick_ms = now_ms;
+    last_orientation_count = imu_orientation_update_count;
+    return;
+  }
+
+  elapsed_ms = now_ms - last_tick_ms;
+  if (elapsed_ms < WAND_DEBUG_STATUS_PERIOD_MS)
+    return;
+
+  orientation_delta =
+      imu_orientation_update_count - last_orientation_count;
+  orientation_rate_hz =
+      (orientation_delta * 1000U + elapsed_ms / 2U) / elapsed_ms;
+  roll_mdeg = (int32_t)lroundf(imu_orientation_roll_deg * 1000.0f);
+  angle_mdeg = (int32_t)lroundf(wand_angle_deg * 1000.0f);
+
+  (void)printf(
+      "[RUN] loaded=%u imu=%ld orient=%lu Hz startup=%u roll=%ld mdeg "
+      "wand=%ld mdeg frame=%lu/%lu lit=%lu tx_ok=%lu attempts=%lu "
+      "spi=%s errors=%lu hal=0x%08lX.\r\n",
+      (unsigned int)wand_loaded,
+      (long)imu_status,
+      (unsigned long)orientation_rate_hz,
+      (unsigned int)imu_orientation_startup,
+      (long)roll_mdeg,
+      (long)angle_mdeg,
+      (unsigned long)wand_sample_index,
+      (unsigned long)((wand_loaded != 0U) ? wand_header.sample_count : 0U),
+      (unsigned long)wand_selected_lit_led_count,
+      (unsigned long)wand_frame_update_count,
+      (unsigned long)wand_frame_attempt_count,
+      WAND_DebugHalStatusName(wand_spi_status),
+      (unsigned long)wand_spi_error_count,
+      (unsigned long)wand_spi_hal_error);
+
+  if (orientation_delta == 0U)
+  {
+    (void)printf(
+        "[WARN][IMU] No synchronized accelerometer/gyro orientation update "
+        "arrived during this interval.\r\n");
+  }
+  if ((imu_orientation_startup != 0U) && (now_ms >= 5000U))
+  {
+    (void)printf(
+        "[WAIT][IMU] Fusion is still in startup; playback intentionally "
+        "keeps the LEDs blank until startup becomes 0. Hold the wand still.\r\n");
+  }
+  if ((wand_loaded != 0U) && (imu_orientation_startup == 0U) &&
+      (wand_selected_lit_led_count == 0U) &&
+      (wand_sample_index != last_blank_sample))
+  {
+    (void)printf(
+        "[INFO][LED] Selected frame %lu contains no illuminated LEDs; "
+        "move the wand or inspect that angle in WAND.json.\r\n",
+        (unsigned long)wand_sample_index);
+    last_blank_sample = wand_sample_index;
+  }
+  if (wand_spi_status != HAL_OK)
+  {
+    (void)printf(
+        "[ERROR][LED] SPI transmission is failing. HAL status=%s, "
+        "error=0x%08lX.\r\n",
+        WAND_DebugHalStatusName(wand_spi_status),
+        (unsigned long)wand_spi_hal_error);
+  }
+
+  last_tick_ms = now_ms;
+  last_orientation_count = imu_orientation_update_count;
+}
+#endif
+
 static void WAND_PlayCurrentAngle(void)
 {
   uint32_t sample_index;
@@ -530,8 +897,10 @@ static void WAND_PlayCurrentAngle(void)
   }
 
   frame = &wand_payload[sample_index * wand_header.frame_bytes];
-  wand_spi_status = (int32_t)SK9822_TransmitFrame(
-      &hspi1, frame, wand_header.frame_bytes);
+#if defined(DEBUG)
+  wand_selected_lit_led_count = WAND_CountLitLeds(frame);
+#endif
+  wand_spi_status = (int32_t)WAND_TransmitTracked(frame);
   if (wand_spi_status == HAL_OK)
   {
     wand_last_sample_index = sample_index;
@@ -568,32 +937,96 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
+#if defined(DEBUG)
+  /* Use the same librdimon semihosting path as imu_calibration_session.c. */
+  initialise_monitor_handles();
+  (void)setvbuf(stdout, NULL, _IONBF, 0);
+  wand_debug_console_ready = 1U;
+  wand_debug_boot_stage = "peripheral initialization";
+  (void)printf(
+      "\r\n[BOOT] STM32 IMU POV wand diagnostics started (Debug build).\r\n");
+  (void)printf(
+      "[BOOT] Console uses ST-LINK GDB Server semihosting; keep the debugger "
+      "connected and resumed.\r\n");
+#endif
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
+#if defined(DEBUG)
+  wand_debug_boot_stage = "GPIO initialization";
+#endif
   MX_GPIO_Init();
+#if defined(DEBUG)
+  (void)printf("[OK][BOOT] GPIO initialized.\r\n");
+  wand_debug_boot_stage = "I2C1 initialization";
+#endif
   MX_I2C1_Init();
+#if defined(DEBUG)
+  (void)printf("[OK][BOOT] I2C1 initialized on PB6/PB7.\r\n");
+  wand_debug_boot_stage = "SDMMC1 handle configuration";
+#endif
   MX_SDMMC1_SD_Init();
+#if defined(DEBUG)
+  (void)printf(
+      "[OK][BOOT] SDMMC1 handle configured; card initialization is deferred "
+      "to FatFs.\r\n");
+  wand_debug_boot_stage = "SPI1 initialization";
+#endif
   MX_SPI1_Init();
+#if defined(DEBUG)
+  (void)printf(
+      "[OK][BOOT] SPI1 initialized: PA5 clock, PA7 data, mode 0, "
+      "9.375 MHz.\r\n");
+  wand_debug_boot_stage = "TIM2 initialization";
+#endif
   MX_TIM2_Init();
+#if defined(DEBUG)
+  (void)printf("[OK][BOOT] TIM2 orientation timestamp timer initialized.\r\n");
+  wand_debug_boot_stage = "application initialization";
+#endif
   /* USER CODE BEGIN 2 */
   /* Keep the strip dark until both the command file and orientation filter
    * are ready.  A missing or invalid SD file remains a visible diagnostic
    * status and does not prevent IMU testing. */
   SK9822_MakeBlankFrame(wand_blank_frame, sizeof(wand_blank_frame));
-  wand_spi_status = (int32_t)SK9822_TransmitFrame(
-      &hspi1, wand_blank_frame, sizeof(wand_blank_frame));
+  wand_spi_status = (int32_t)WAND_TransmitTracked(wand_blank_frame);
+#if defined(DEBUG)
+  (void)printf(
+      "[%s][LED] Initial blank-frame SPI result=%s, HAL error=0x%08lX.\r\n",
+      (wand_spi_status == HAL_OK) ? "OK" : "ERROR",
+      WAND_DebugHalStatusName(wand_spi_status),
+      (unsigned long)wand_spi_hal_error);
+  WAND_DebugRunLedSelfTest();
+#endif
 
   wand_storage_status = (int32_t)WAND_StorageLoad(
       wand_payload, sizeof(wand_payload), &wand_header);
   wand_loaded = (wand_storage_status == WAND_STORAGE_OK) ? 1U : 0U;
+#if defined(DEBUG)
+  WAND_DebugPrintStorageStatus();
+#endif
 
   imu_status = IMU_Init();
+#if defined(DEBUG)
+  (void)printf(
+      "[%s][IMU] initialization status=%ld, WHO_AM_I=0x%02X "
+      "(expected 0x%02X), HAL I2C address=0x%02X.\r\n",
+      (imu_status == 0) ? "OK" : "ERROR",
+      (long)imu_status,
+      (unsigned int)imu_who_am_i,
+      (unsigned int)LSM6DSV320X_ID,
+      (unsigned int)imu_i2c_address);
+#endif
 
   /* Stop here on initialization failure so imu_status stays visible. */
   if (imu_status != 0)
   {
+#if defined(DEBUG)
+    (void)printf(
+        "[FATAL][IMU] Initialization failed at step %ld. Playback cannot "
+        "start; inspect the status, WHO_AM_I, wiring, CS high, and SA0.\r\n",
+        (long)imu_status);
+#endif
     while (1)
     {
       HAL_Delay(100U);
@@ -603,6 +1036,9 @@ int main(void)
   if (HAL_TIM_Base_Start(&htim2) != HAL_OK)
   {
     imu_status = -30;
+#if defined(DEBUG)
+    (void)printf("[FATAL][TIM2] Timer start failed; imu_status=-30.\r\n");
+#endif
     while (1)
     {
       HAL_Delay(100U);
@@ -610,12 +1046,17 @@ int main(void)
   }
 
   IMU_OrientationInitialise(IMU_OUTPUT_DATA_RATE_HZ);
+#if defined(DEBUG)
+  (void)printf(
+      "[OK][IMU] Orientation filter initialized at %lu Hz. LEDs remain "
+      "blank while fusion startup=1 (normally about 3 seconds).\r\n",
+      (unsigned long)((uint32_t)IMU_OUTPUT_DATA_RATE_HZ));
+#endif
 
   if (imu_run_calibration_on_boot != 0U)
   {
 #if defined(DEBUG)
-    /* Connect standard printf/fopen calls to the debugger via librdimon. */
-    initialise_monitor_handles();
+    (void)printf("[BOOT] Entering the requested IMU calibration session.\r\n");
 #endif
     imu_status = IMU_RunCalibrationSession(IMU_ReadSensors, HAL_Delay);
 
@@ -625,6 +1066,12 @@ int main(void)
       HAL_Delay(100U);
     }
   }
+#if defined(DEBUG)
+  (void)printf(
+      "[BOOT] Entering playback loop: loaded=%u. Runtime status follows once "
+      "per second.\r\n",
+      (unsigned int)wand_loaded);
+#endif
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -633,6 +1080,9 @@ int main(void)
   {
     imu_status = IMU_ReadAll();
     WAND_PlayCurrentAngle();
+#if defined(DEBUG)
+    WAND_DebugPoll();
+#endif
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -916,7 +1366,20 @@ void MPU_Config(void)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+#if defined(DEBUG)
+  if (wand_debug_console_ready != 0U)
+  {
+    (void)printf(
+        "[FATAL][HAL] Error_Handler reached during %s at tick %lu ms. "
+        "I2C error=0x%08lX, SPI error=0x%08lX, SD error=0x%08lX.\r\n",
+        wand_debug_boot_stage,
+        (unsigned long)HAL_GetTick(),
+        (unsigned long)HAL_I2C_GetError(&hi2c1),
+        (unsigned long)HAL_SPI_GetError(&hspi1),
+        (unsigned long)hsd1.ErrorCode);
+    (void)fflush(stdout);
+  }
+#endif
   __disable_irq();
   while (1)
   {
@@ -934,8 +1397,18 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+#if defined(DEBUG)
+  if (wand_debug_console_ready != 0U)
+  {
+    (void)printf("[FATAL][ASSERT] %s:%lu.\r\n",
+                 (const char *)file,
+                 (unsigned long)line);
+    (void)fflush(stdout);
+  }
+#else
+  (void)file;
+  (void)line;
+#endif
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
