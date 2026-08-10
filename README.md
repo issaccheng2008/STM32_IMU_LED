@@ -108,6 +108,49 @@ claiming a sensor register rate the complete polling loop cannot sustain.
 - A new SPI transfer is skipped when two orientation updates select the same
   angle frame.
 
+## Debug console and LED self-test
+
+The Debug configuration now uses the same standard `printf()` plus librdimon
+semihosting path as `imu_calibration_session.c`.  Start the included
+`LED-test Debug.launch` configuration, keep **Enable terminal and File I/O
+mode** selected, open the CubeIDE Console, and press **Resume (F8)**.  Debug
+output requires the ST-Link debugger to remain connected; use the Release
+configuration for standalone operation.
+
+Every Debug boot performs a one-second, 1/31-brightness LED hardware test before
+the SD card or IMU can gate playback.  LEDs 0-11 should be red, LEDs 12-23
+green, and LEDs 24-34 blue, after which the strip is blanked.  Set
+`wand_debug_led_self_test_on_boot` to `0` in Live Expressions while stopped at
+`main()` to skip it.
+
+The console then reports each boundary independently:
+
+| Prefix | What it proves or identifies |
+|---|---|
+| `[TEST][LED] ... HAL_OK` | STM32 SPI accepted the 148-byte command; if the RGB test is invisible, inspect LED power, common ground, strip input direction, PA5/PA7, and logic levels |
+| `[ERROR][SD]` | Exact loader phase, FatFs result, WAND parser result, actual byte count, and expected size |
+| `[OK][SD]` | `WAND.POV` was completely loaded and both CRCs passed; the following content count warns if all commands are black |
+| `[ERROR][IMU]` | IMU initialization step, WHO_AM_I, selected I2C address, or live read status failed |
+| `[WAIT][IMU]` | Fusion startup is still intentionally preventing playback |
+| `[RUN]` | Once-per-second orientation rate, roll, mapped angle, frame index, illuminated LED count, successful transmissions, attempts, and SPI errors |
+| `[FATAL][HAL]` | Cube HAL initialization entered `Error_Handler()`, including the boot stage and peripheral error flags |
+
+The fastest diagnosis is:
+
+1. If the RGB boot test is invisible but reports `HAL_OK`, debug the LED power
+   and SPI electrical path before the SD card or IMU.
+2. If the boot test is visible, follow the first `[ERROR][SD]` or
+   `[ERROR][IMU]` message.
+3. If startup reaches `[RUN]`, confirm `startup=0`, `orient` is nonzero,
+   `lit` is nonzero for the selected frame, `tx_ok` increases as the angle
+   changes, and `spi=HAL_OK`.
+4. A changing frame with `lit=0` is a valid black command, not an SPI failure;
+   inspect that angle in `WAND.json` or reposition the image in the converter.
+
+Periodic output is deliberately limited to one line per second because every
+semihosting call pauses the MCU.  Set `wand_debug_periodic_output_enabled` to
+`0` in Live Expressions when measuring maximum IMU/playback timing.
+
 Useful Live Expressions are:
 
 | Variable | Meaning |
@@ -117,7 +160,11 @@ Useful Live Expressions are:
 | `wand_angle_deg` | Current mapped angle in the converter convention |
 | `wand_sample_index` | Nearest selected WAND1 frame |
 | `wand_frame_update_count` | Successful LED frame transmissions |
+| `wand_frame_attempt_count` | All SPI attempts, including the Debug boot test |
 | `wand_spi_status` | Latest `HAL_SPI_Transmit` result |
+| `wand_spi_hal_error` | Detailed HAL SPI error bitmask |
+| `wand_spi_error_count` | Number of failed SPI attempts |
+| `wand_selected_lit_led_count` | Non-black LEDs in the selected command frame |
 | `imu_orientation_sample_rate_hz` | Measured orientation update rate |
 | `imu_status` | Latest IMU initialization/read result |
 
@@ -146,8 +193,9 @@ by the STM32.
 
 The existing low-g, high-g, and gyroscope calibration workflow remains
 available.  Set `imu_run_calibration_on_boot` in Live Expressions while stopped
-at `main()` to enter the semihosting calibration session.  Normal standalone
-playback leaves it at `0`; semihosting is not used in the real-time loop.
+at `main()` to enter the semihosting calibration session.  Normal playback
+leaves it at `0`.  The Debug build also uses semihosting for the diagnostics
+above; the Release build contains neither console calls nor the RGB self-test.
 
 ## Tests
 
