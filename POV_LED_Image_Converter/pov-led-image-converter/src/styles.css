@@ -130,8 +130,6 @@ input[type="range"] { grid-column: 1/-1; width: 100%; accent-color: var(--lime);
 .timeline-panel { padding: 18px 20px 21px; background: #0c1013; }
 .timeline-topline { display: flex; justify-content: space-between; align-items: center; }
 .timeline-topline h2 { margin: 3px 0 0; font: 700 24px var(--font-mono); }
-.play-button { height: 34px; border: 1px solid var(--line); background: var(--surface-2); padding: 0 11px; font-size: 10px; cursor: pointer; }
-.play-button:hover { border-color: var(--lime); }
 .angle-slider { width: 100%; margin-top: 15px; accent-color: var(--lime); }
 .angle-scale { display: flex; justify-content: space-between; color: #59636b; font: 8px var(--font-mono); }
 .led-strip { display: grid; grid-template-columns: repeat(35, minmax(3px, 1fr)); gap: 2px; height: 58px; margin-top: 14px; }

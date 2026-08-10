@@ -25,6 +25,11 @@
 #include "imu_calibration_session.h"
 #include "imu_orientation.h"
 #include "lsm6dsv320x_reg.h"
+#include "sk9822.h"
+#include "wand_file.h"
+#include "wand_storage.h"
+
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -34,8 +39,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define IMU_OUTPUT_DATA_RATE_HZ 480.0f
+#define IMU_OUTPUT_DATA_RATE_HZ 1920.0f
 #define IMU_ORIENTATION_TIMER_SECONDS_PER_TICK 1.0e-6f
+
+#if (WAND1_LED_COUNT != SK9822_LED_COUNT) || \
+    (WAND1_SK9822_FRAME_BYTES != SK9822_FRAME_BYTES)
+#error "WAND1 and SK9822 layouts must stay identical"
+#endif
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,6 +57,10 @@
 
 I2C_HandleTypeDef hi2c1;
 
+SD_HandleTypeDef hsd1;
+
+SPI_HandleTypeDef hspi1;
+
 TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
@@ -54,6 +68,30 @@ static stmdev_ctx_t imu_ctx;
 static uint8_t imu_orientation_pending_mask = 0U;
 static uint8_t imu_orientation_timestamp_valid = 0U;
 static uint32_t imu_orientation_last_timestamp_us = 0U;
+static uint32_t wand_last_orientation_update_count = 0U;
+static uint32_t wand_last_sample_index = 0U;
+static uint8_t wand_last_sample_valid = 0U;
+
+/* The largest legal WAND1 payload is 1,801 complete 148-byte SK9822
+ * frames (266,548 bytes).  STM32H743 RAM_D1 has room for it, so playback
+ * performs no SD-card reads after startup. */
+static uint8_t wand_payload[WAND1_MAX_PAYLOAD_BYTES]
+    __attribute__((aligned(32)));
+static wand1_header_t wand_header;
+static uint8_t wand_blank_frame[SK9822_FRAME_BYTES];
+
+/** SD/FatFs/WAND preload result. Zero means WAND.POV is ready in RAM. */
+volatile int32_t wand_storage_status = WAND_STORAGE_ERROR_ARGUMENT;
+/** Nonzero after a complete, CRC-checked WAND.POV has been preloaded. */
+volatile uint8_t wand_loaded = 0U;
+/** Current wand angle: -90 deg counterclockwise, 0 upright, +90 clockwise. */
+volatile float wand_angle_deg = 0.0f;
+/** Nearest frame currently selected from the preloaded WAND1 payload. */
+volatile uint32_t wand_sample_index = 0U;
+/** Number of new SK9822 frames sent by the playback loop. */
+volatile uint32_t wand_frame_update_count = 0U;
+/** Most recent HAL SPI result returned while updating the strip. */
+volatile int32_t wand_spi_status = HAL_OK;
 
 /** Last IMU initialization or read result: 0 means success. */
 volatile int32_t imu_status = -1;
@@ -92,11 +130,11 @@ volatile int16_t imu_gyro_x_raw = 0;
 volatile int16_t imu_gyro_y_raw = 0;
 /** Gyroscope Z-axis register value (raw signed counts). */
 volatile int16_t imu_gyro_z_raw = 0;
-/** X-axis angular rate in degrees per second, configured for +/-500 dps. */
+/** X-axis angular rate in degrees per second, configured for +/-4000 dps. */
 volatile float imu_gyro_x_dps = 0.0f;
-/** Y-axis angular rate in degrees per second, configured for +/-500 dps. */
+/** Y-axis angular rate in degrees per second, configured for +/-4000 dps. */
 volatile float imu_gyro_y_dps = 0.0f;
-/** Z-axis angular rate in degrees per second, configured for +/-500 dps. */
+/** Z-axis angular rate in degrees per second, configured for +/-4000 dps. */
 volatile float imu_gyro_z_dps = 0.0f;
 /** Calibrated X-axis angular rate in degrees per second. */
 volatile float imu_gyro_x_calibrated_dps = 0.0f;
@@ -142,11 +180,14 @@ void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_SDMMC1_SD_Init(void);
+static void MX_SPI1_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 static int32_t IMU_Init(void);
 static int32_t IMU_ReadAll(void);
 static int32_t IMU_ReadSensors(imu_calibration_measurement_t *measurement);
+static void WAND_PlayCurrentAngle(void);
 #if defined(DEBUG)
 extern void initialise_monitor_handles(void);
 #endif
@@ -165,7 +206,7 @@ static int32_t platform_write(void *handle, uint8_t reg,
                              I2C_MEMADD_SIZE_8BIT,
                              (uint8_t *)buffer,
                              length,
-                             100U);
+                             5U);
 
   return (result == HAL_OK) ? 0 : -1;
 }
@@ -181,7 +222,7 @@ static int32_t platform_read(void *handle, uint8_t reg,
                             I2C_MEMADD_SIZE_8BIT,
                             buffer,
                             length,
-                            100U);
+                            5U);
 
   return (result == HAL_OK) ? 0 : -1;
 }
@@ -233,23 +274,24 @@ static int32_t IMU_Init(void)
   if (lsm6dsv320x_xl_full_scale_set(&imu_ctx, LSM6DSV320X_4g) != 0)
     return -5;
 
-  if (lsm6dsv320x_gy_full_scale_set(&imu_ctx, LSM6DSV320X_500dps) != 0)
+  if (lsm6dsv320x_gy_full_scale_set(&imu_ctx, LSM6DSV320X_4000dps) != 0)
     return -6;
 
   if (lsm6dsv320x_hg_xl_full_scale_set(&imu_ctx, LSM6DSV320X_32g) != 0)
     return -7;
 
-  /* Low-g accelerometer: 480 samples/second, high-performance mode. */
+  /* 1.92 kHz is the highest practical polling rate over 1 MHz I2C while
+   * leaving enough bandwidth for status, acceleration, and gyro transfers. */
   if (lsm6dsv320x_xl_setup(&imu_ctx,
-                           LSM6DSV320X_ODR_AT_480Hz,
+                           LSM6DSV320X_ODR_AT_1920Hz,
                            LSM6DSV320X_XL_HIGH_PERFORMANCE_MD) != 0)
   {
     return -8;
   }
 
-  /* Gyroscope: 480 samples/second, high-performance mode. */
+  /* The +/-4000 dps range avoids clipping a 10 Hz, +/-35 degree wave. */
   if (lsm6dsv320x_gy_setup(&imu_ctx,
-                           LSM6DSV320X_ODR_AT_480Hz,
+                           LSM6DSV320X_ODR_AT_1920Hz,
                            LSM6DSV320X_GY_HIGH_PERFORMANCE_MD) != 0)
   {
     return -9;
@@ -264,30 +306,21 @@ static int32_t IMU_Init(void)
     return -10;
   }
 
-  /*
-   * Low-g accelerometer output path:
-   * LPF1 -> LPF2 -> output registers
-   *
-   * XL_LIGHT means LPF2 bandwidth = ODR / 20.
-   * At 480 Hz, cutoff is approximately 24 Hz.
-   */
+  /* Use LPF1 directly.  Bypassing LPF2 removes the former medium-bandwidth
+   * filter delay; XL_ULTRA_LIGHT is retained for a regeneration-safe setup. */
   if (lsm6dsv320x_filt_xl_setup(
           &imu_ctx,
-          LSM6DSV320X_XL_FILT_LP_LPF2,
-          LSM6DSV320X_XL_MEDIUM,
+          LSM6DSV320X_XL_FILT_LP_LPF1,
+          LSM6DSV320X_XL_ULTRA_LIGHT,
           0U) != 0)
   {
     return -11;
   }
 
-  /*
-   * Gyroscope LPF1.
-   * At a 480 Hz ODR, GY_VERY_STRONG gives approximately 56.7 Hz
-   * overall gyro bandwidth.
-   */
+  /* Minimum LPF1 filtering gives the lowest sensor-side gyro latency. */
   if (lsm6dsv320x_filt_gy_lp1_bandwidth_set(
           &imu_ctx,
-          LSM6DSV320X_GY_VERY_STRONG) != 0)
+          LSM6DSV320X_GY_ULTRA_LIGHT) != 0)
   {
     return -12;
   }
@@ -299,12 +332,7 @@ static int32_t IMU_Init(void)
     return -13;
   }
 
-  /*
-   * Allow the gyro and accelerometer filters to settle.
-   * This delay is appropriate for the particular settings above.
-   */
-  HAL_Delay(150U);
-
+  /* Allow the newly enabled high-performance paths to settle. */
   HAL_Delay(50U);
   return 0;
 }
@@ -360,9 +388,9 @@ static int32_t IMU_ReadSensors(imu_calibration_measurement_t *measurement)
     imu_gyro_x_raw = raw_axes[0];
     imu_gyro_y_raw = raw_axes[1];
     imu_gyro_z_raw = raw_axes[2];
-    imu_gyro_x_dps = lsm6dsv320x_from_fs500_to_mdps(raw_axes[0]) / 1000.0f;
-    imu_gyro_y_dps = lsm6dsv320x_from_fs500_to_mdps(raw_axes[1]) / 1000.0f;
-    imu_gyro_z_dps = lsm6dsv320x_from_fs500_to_mdps(raw_axes[2]) / 1000.0f;
+    imu_gyro_x_dps = lsm6dsv320x_from_fs4000_to_mdps(raw_axes[0]) / 1000.0f;
+    imu_gyro_y_dps = lsm6dsv320x_from_fs4000_to_mdps(raw_axes[1]) / 1000.0f;
+    imu_gyro_z_dps = lsm6dsv320x_from_fs4000_to_mdps(raw_axes[2]) / 1000.0f;
     {
       const imu_vector3_t raw_dps = {
           imu_gyro_x_dps, imu_gyro_y_dps, imu_gyro_z_dps};
@@ -471,6 +499,46 @@ static int32_t IMU_ReadAll(void)
 
   return 0;
 }
+
+static void WAND_PlayCurrentAngle(void)
+{
+  uint32_t sample_index;
+  int32_t roll_mdeg;
+  int32_t angle_mdeg;
+  const uint8_t *frame;
+
+  if (imu_orientation_update_count == wand_last_orientation_update_count)
+    return;
+
+  wand_last_orientation_update_count = imu_orientation_update_count;
+  roll_mdeg = (int32_t)lroundf(imu_orientation_roll_deg * 1000.0f);
+  angle_mdeg = WAND_RollToAngleMdeg(roll_mdeg);
+  wand_angle_deg = (float)angle_mdeg / 1000.0f;
+
+  if ((wand_loaded == 0U) || (imu_orientation_startup != 0U))
+    return;
+
+  sample_index = WAND_AngleToSample(&wand_header, angle_mdeg);
+  wand_sample_index = sample_index;
+
+  /* The sensor runs faster than most exported angle grids.  Avoid spending
+   * SPI bandwidth when consecutive orientation estimates select one frame. */
+  if ((wand_last_sample_valid != 0U) &&
+      (sample_index == wand_last_sample_index))
+  {
+    return;
+  }
+
+  frame = &wand_payload[sample_index * wand_header.frame_bytes];
+  wand_spi_status = (int32_t)SK9822_TransmitFrame(
+      &hspi1, frame, wand_header.frame_bytes);
+  if (wand_spi_status == HAL_OK)
+  {
+    wand_last_sample_index = sample_index;
+    wand_last_sample_valid = 1U;
+    wand_frame_update_count++;
+  }
+}
 /* USER CODE END 0 */
 
 /**
@@ -506,8 +574,21 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_I2C1_Init();
+  MX_SDMMC1_SD_Init();
+  MX_SPI1_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+  /* Keep the strip dark until both the command file and orientation filter
+   * are ready.  A missing or invalid SD file remains a visible diagnostic
+   * status and does not prevent IMU testing. */
+  SK9822_MakeBlankFrame(wand_blank_frame, sizeof(wand_blank_frame));
+  wand_spi_status = (int32_t)SK9822_TransmitFrame(
+      &hspi1, wand_blank_frame, sizeof(wand_blank_frame));
+
+  wand_storage_status = (int32_t)WAND_StorageLoad(
+      wand_payload, sizeof(wand_payload), &wand_header);
+  wand_loaded = (wand_storage_status == WAND_STORAGE_OK) ? 1U : 0U;
+
   imu_status = IMU_Init();
 
   /* Stop here on initialization failure so imu_status stays visible. */
@@ -551,7 +632,7 @@ int main(void)
   while (1)
   {
     imu_status = IMU_ReadAll();
-    HAL_Delay(1U);
+    WAND_PlayCurrentAngle();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -584,7 +665,18 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  /* Keep the CPU on the 64 MHz HSI while using a 75 MHz PLL1 Q output for
+   * SPI1 and SDMMC1.  This is the clock setup proven by LED_strip_test. */
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 9;
+  RCC_OscInitStruct.PLL.PLLP = 2;
+  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_3;
+  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOMEDIUM;
+  RCC_OscInitStruct.PLL.PLLFRACN = 3072;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -598,8 +690,8 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
   RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV2;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
+  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV1;
   RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV1;
 
@@ -625,7 +717,8 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x00707CBB;
+  /* 1 MHz Fast-mode Plus with a 64 MHz I2C kernel clock. */
+  hi2c1.Init.Timing = 0x00610E1A;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -652,9 +745,67 @@ static void MX_I2C1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN I2C1_Init 2 */
-
+  HAL_I2CEx_EnableFastModePlus(I2C_FASTMODEPLUS_PB6);
+  HAL_I2CEx_EnableFastModePlus(I2C_FASTMODEPLUS_PB7);
   /* USER CODE END I2C1_Init 2 */
 
+}
+
+/**
+  * @brief SDMMC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SDMMC1_SD_Init(void)
+{
+  /* Card initialization is deliberately deferred to FatFs disk_initialize().
+   * That lets a missing card produce WAND_STORAGE_ERROR_MOUNT instead of
+   * trapping the entire IMU application in Error_Handler(). */
+  hsd1.Instance = SDMMC1;
+  hsd1.Init.ClockEdge = SDMMC_CLOCK_EDGE_RISING;
+  hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
+  hsd1.Init.BusWide = SDMMC_BUS_WIDE_4B;
+  hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_DISABLE;
+  hsd1.Init.ClockDiv = 2;
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES_TXONLY;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  /* PLL1 Q = 75 MHz; /8 gives a 9.375 MHz SK9822 clock. */
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 0x0;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  hspi1.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
+  hspi1.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
+  hspi1.Init.TxCRCInitializationPattern =
+      SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi1.Init.RxCRCInitializationPattern =
+      SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi1.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;
+  hspi1.Init.MasterInterDataIdleness =
+      SPI_MASTER_INTERDATA_IDLENESS_00CYCLE;
+  hspi1.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
+  hspi1.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
+  hspi1.Init.IOSwap = SPI_IO_SWAP_DISABLE;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 /**
@@ -717,6 +868,8 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 

@@ -11,8 +11,7 @@ const solidPixel = {
 };
 
 const conversion = Core.convertImage(solidPixel, {
-  ledCount: 2,
-  stripLengthCm: 1,
+  stripLengthCm: 25,
   pivotOffsetCm: 2,
   requestedStepDeg: 45,
   imageCenterXCm: 0,
@@ -22,5 +21,4 @@ const conversion = Core.convertImage(solidPixel, {
   globalBrightness: 3,
 });
 
-fs.writeFileSync(path.join(__dirname, "fixture.pov"), Core.buildPovBinary(conversion));
-
+fs.writeFileSync(path.join(__dirname, "fixture.pov"), Core.buildWandBinary(conversion));

@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
-    <meta name="description" content="Offline image-to-POV LED command converter for a rotating 35-pixel SK9822 strip." />
-    <title>POV LED Image Converter</title>
+    <meta name="description" content="Offline image-to-SK9822 command converter for a hand-waved 35-LED POV wand." />
+    <title>POV Wand Image Converter</title>
     <link rel="stylesheet" href="src/styles.css" />
   </head>
   <body>
@@ -13,8 +13,8 @@
       <div class="brand">
         <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
         <div>
-          <p class="eyebrow">ROTARY LIGHT LAB / OFFLINE TOOL</p>
-          <h1>POV LED Image Converter</h1>
+          <p class="eyebrow">HANDHELD LIGHT LAB / OFFLINE TOOL</p>
+          <h1>POV Wand Image Converter</h1>
         </div>
       </div>
       <div class="header-status">
@@ -42,18 +42,14 @@
         <section class="panel-section">
           <div class="section-heading">
             <span class="step-index">02</span>
-            <div><h2>Rotating strip</h2><p>Distances are LED-center to LED-center</p></div>
+            <div><h2>Wand geometry</h2><p>Upright is 0°; left is negative</p></div>
           </div>
           <div class="field-grid two-column">
-            <label class="field"><span>LED count</span><input id="ledCount" data-config="ledCount" type="number" min="1" max="1024" step="1" value="35" /></label>
+            <label class="field"><span>LED count</span><input id="ledCount" type="number" value="35" disabled /><small>Fixed by the STM32 firmware.</small></label>
             <label class="field"><span>Strip length <em>cm</em></span><input id="stripLengthCm" data-config="stripLengthCm" type="number" min="0" step="0.1" value="25" /></label>
           </div>
           <label class="field wide"><span>Pivot → LED 0 <em>cm</em></span><input id="pivotOffsetCm" data-config="pivotOffsetCm" type="number" step="0.1" value="0" /><small>Positive: pivot below LED 0. Negative: pivot is farther up the strip.</small></label>
-          <div class="field-grid two-column">
-            <label class="field"><span>Angle interval <em>°</em></span><input id="requestedStepDeg" data-config="requestedStepDeg" type="number" min="0.05" max="45" step="0.05" value="1" /></label>
-            <label class="field"><span>Direction</span><select id="clockwise" data-config="clockwise"><option value="true">Clockwise</option><option value="false">Counterclockwise</option></select></label>
-          </div>
-          <label class="field wide"><span>Hardware 0° direction <em>° clockwise from up</em></span><input id="zeroAngleDeg" data-config="zeroAngleDeg" type="number" step="0.1" value="0" /></label>
+          <label class="field wide"><span>Angle interval <em>°</em></span><input id="requestedStepDeg" data-config="requestedStepDeg" type="number" min="0.1" max="45" step="0.1" value="1" /><small>Frames always cover −90° through +90°, including both endpoints.</small></label>
           <div class="derived-row"><span>LED pitch</span><strong id="ledPitchReadout">0.735 cm</strong></div>
         </section>
 
@@ -77,7 +73,7 @@
         <section class="panel-section">
           <div class="section-heading">
             <span class="step-index">04</span>
-            <div><h2>Color output</h2><p>RGB payload; firmware sends SK9822 as G-R-B</p></div>
+            <div><h2>LED output</h2><p>Binary stores complete SK9822 wire frames</p></div>
           </div>
           <div class="field-grid two-column">
             <label class="field"><span>Sampling</span><select id="interpolation" data-config="interpolation"><option value="bilinear">Bilinear</option><option value="nearest">Nearest</option></select></label>
@@ -90,7 +86,7 @@
       <section class="preview-column">
         <div class="preview-toolbar">
           <div class="view-tabs" role="tablist" aria-label="Preview mode">
-            <button type="button" class="view-tab active" data-view="reconstruction" role="tab">POV reconstruction</button>
+            <button type="button" class="view-tab active" data-view="reconstruction" role="tab">Sweep reconstruction</button>
             <button type="button" class="view-tab" data-view="map" role="tab">Angle × LED map</button>
             <button type="button" class="view-tab" data-view="geometry" role="tab">Source geometry</button>
           </div>
@@ -109,10 +105,9 @@
               <p class="eyebrow">ANGLE INSPECTOR</p>
               <h2 id="selectedAngleLabel">0.000°</h2>
             </div>
-            <button type="button" class="play-button" id="playButton" aria-label="Play angle animation"><span id="playIcon">▶</span> Animate</button>
           </div>
-          <input id="angleSlider" class="angle-slider" type="range" min="0" max="359" step="1" value="0" aria-label="Selected angle sample" />
-          <div class="angle-scale"><span>0°</span><span>90°</span><span>180°</span><span>270°</span><span>360°</span></div>
+          <input id="angleSlider" class="angle-slider" type="range" min="0" max="180" step="1" value="90" aria-label="Selected angle sample" />
+          <div class="angle-scale"><span>−90°</span><span>−45°</span><span>0° upright</span><span>+45°</span><span>+90°</span></div>
           <div class="led-strip" id="ledStrip" aria-label="Colors for every LED at the selected angle"></div>
           <div class="strip-labels"><span>LED 0 · nearest</span><span id="outerLedLabel">LED 34 · farthest</span></div>
         </section>
@@ -121,11 +116,11 @@
       <aside class="output-panel" aria-label="Output and performance">
         <section class="output-summary">
           <p class="eyebrow">CONVERSION READY</p>
-          <div class="summary-number"><strong id="frameCount">360</strong><span>angle frames</span></div>
+          <div class="summary-number"><strong id="frameCount">181</strong><span>angle frames</span></div>
           <dl class="summary-grid">
             <div><dt>Actual interval</dt><dd id="actualStep">1.000000°</dd></div>
-            <div><dt>LED samples</dt><dd id="sampleCount">12,600</dd></div>
-            <div><dt>RGB payload</dt><dd id="payloadSize">36.9 KiB</dd></div>
+            <div><dt>LED samples</dt><dd id="sampleCount">6,335</dd></div>
+            <div><dt>Command file</dt><dd id="payloadSize">26.2 KiB</dd></div>
             <div><dt>Lit samples</dt><dd id="litPercent">—</dd></div>
           </dl>
           <p class="adjustment-note" id="stepAdjustment" hidden></p>
@@ -134,48 +129,51 @@
         <section class="output-section">
           <div class="section-heading small">
             <span class="step-index">05</span>
-            <div><h2>Runtime estimate</h2><p>Checks update timing before firmware work</p></div>
+            <div><h2>Wave estimate</h2><p>One cycle is left→right→left</p></div>
           </div>
           <div class="field-grid two-column">
-            <label class="field"><span>Speed <em>RPM</em></span><input id="rpm" type="number" min="0" step="10" value="1000" /></label>
-            <label class="field"><span>SPI clock <em>MHz</em></span><input id="spiMhz" type="number" min="0.1" max="30" step="0.5" value="8" /></label>
+            <label class="field"><span>Cycles / second</span><input id="waveCyclesPerSecond" type="number" min="0" max="100" step="0.5" value="10" /></label>
+            <label class="field"><span>Wave angle <em>±°</em></span><input id="waveAngleDeg" type="number" min="0" max="90" step="1" value="35" /></label>
+            <label class="field"><span>SPI clock <em>MHz</em></span><input id="spiMhz" type="number" min="0.1" max="30" step="0.125" value="9.375" /></label>
           </div>
           <dl class="performance-list">
-            <div><dt>LED updates / second</dt><dd id="updatesPerSecond">6,000</dd></div>
-            <div><dt>SD payload stream</dt><dd id="sdRate">615 KiB/s</dd></div>
-            <div><dt>SK9822 bus use</dt><dd id="busUse">88.8%</dd></div>
+            <div><dt>Average frame changes / s</dt><dd id="updatesPerSecond">1,400</dd></div>
+            <div><dt>Peak frame changes / s</dt><dd id="peakUpdatesPerSecond">2,199</dd></div>
+            <div><dt>Peak LED command data</dt><dd id="peakLedDataRate">318 KiB/s</dd></div>
+            <div><dt>Peak angular rate</dt><dd id="peakAngularRate">2,199 °/s</dd></div>
+            <div><dt>One-time SD preload</dt><dd id="startupRead">26.2 KiB</dd></div>
+            <div><dt>Peak SK9822 bus use</dt><dd id="busUse">27.8%</dd></div>
           </dl>
           <div class="performance-meter"><span id="performanceBar"></span></div>
-          <p class="performance-status" id="performanceStatus">Timing fits, with little margin.</p>
+          <p class="performance-status" id="performanceStatus">Checking the firmware timing limits…</p>
         </section>
 
         <section class="output-section export-section">
           <div class="section-heading small">
             <span class="step-index">06</span>
-            <div><h2>Export</h2><p>Angle-major raw RGB for microSD</p></div>
+            <div><h2>Export</h2><p>Copy WAND.POV to the microSD root</p></div>
           </div>
-          <label class="field wide"><span>File name</span><input id="fileName" type="text" value="image_35led_1deg" /></label>
-          <button type="button" class="primary-button" id="downloadPov"><span>↓</span> Download STM32 binary <kbd>.pov</kbd></button>
-          <button type="button" class="secondary-button" id="downloadJson">Download readable check file <kbd>.json</kbd></button>
+          <button type="button" class="primary-button" id="downloadPov"><span>↓</span> Download <kbd>WAND.POV</kbd></button>
+          <button type="button" class="secondary-button" id="downloadJson">Download translated <kbd>WAND.json</kbd></button>
           <div class="format-note">
-            <strong>POV1 · little-endian · CRC32</strong>
-            <span>80-byte header + <code>angle → LED → R,G,B</code></span>
+            <strong>WAND1 · little-endian · CRC32</strong>
+            <span>48-byte header + <code>angle → complete SK9822 frame</code></span>
           </div>
         </section>
 
         <section class="output-section how-it-works">
           <h2>What the converter samples</h2>
           <ol>
-            <li>The virtual strip rotates around the pivot.</li>
-            <li>Each LED center samples the image at every angle.</li>
-            <li>Firmware reads one contiguous RGB frame, then transmits SK9822 bytes.</li>
+            <li>The virtual wand sweeps from −90° to +90° around the pivot.</li>
+            <li>Each LED center samples the image at every stored angle.</li>
+            <li>The STM32 preloads the file, then transmits the selected bytes directly.</li>
           </ol>
         </section>
       </aside>
     </main>
 
     <footer>
-      <span>Designed for 35 × SK9822 LEDs on a 25 cm rotating arm</span>
+      <span>Designed for 35 × SK9822 LEDs on a hand-waved 25 cm wand</span>
       <span>All image processing stays in this browser tab</span>
     </footer>
 

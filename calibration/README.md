@@ -14,7 +14,8 @@ both terminal and host-file semihosting, so no hand-written OpenOCD launch is
 needed.
 
 1. Open **Run -> Debug Configurations** and select the normal
-   `LED-test Debug` launch. On the **Debugger** tab, keep:
+   `LED-test Debug.launch` configuration for the `STM32_IMU_LED` project. On
+   the **Debugger** tab, keep:
    - **Debug probe:** `ST-LINK GDB Server`
    - **Interface:** `SWD`
    - **Reset mode:** `Connect under reset`
@@ -30,12 +31,12 @@ needed.
      excludes `Src/syscalls.c` for Debug.
 4. Run **Project -> Clean**, then build the **Debug** configuration. This is
    required after importing the changed linker settings.
-5. Start `LED-test Debug`. When execution stops at `main`, add
+5. Start that Debug configuration. When execution stops at `main`, add
    `imu_run_calibration_on_boot` to Live Expressions and set it to `1` before
    resuming. `initialise_monitor_handles()` runs only when calibration was
    requested, immediately before the first console/file operation.
 6. Open **Window -> Show View -> Console** and select the console named for
-   `LED-test Debug` or its semihosting terminal. Press **Resume (F8)**.
+   `STM32_IMU_LED` or its semihosting terminal. Press **Resume (F8)**.
 7. Follow the debugger-console prompts. For every orientation, place the board
    at a different angle, take your hands off it, and wait for the `3, 2, 1`
    countdown. The firmware averages 256 fresh samples from each accelerometer.
