@@ -2,11 +2,12 @@
   "name": "pov-led-image-converter",
   "version": "1.0.0",
   "private": true,
-  "description": "Offline radial image sampler and POV1 exporter for rotating LED strips",
+  "description": "Offline image sampler and WAND1 SK9822 exporter for a hand-waved POV wand",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node tests/test-core.js"
+    "test": "node tests/test-core.js && npm run test:firmware",
+    "test:firmware": "node tests/make-fixture.js && cc -std=c11 -Wall -Wextra -Werror -I../../Core/Inc tests/test-firmware.c ../../Core/Src/wand_file.c -o tests/test-firmware && ./tests/test-firmware"
   },
   "devDependencies": {
     "vite": "^7.1.1"

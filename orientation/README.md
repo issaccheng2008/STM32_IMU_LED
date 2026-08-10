@@ -31,12 +31,16 @@ IMU module is mounted in another orientation, remap its axes before calling
 
 The settings are in `Core/Src/imu_orientation.c`:
 
-- 480 Hz nominal sample rate, matching the configured sensor ODR
+- 1,920 Hz nominal sample rate, matching the configured sensor ODR
 - gain 0.5
-- +/-500 dps gyroscope range
+- +/-4,000 dps gyroscope range for fast wand motion
 - 10 degree acceleration-rejection threshold
 - 5 second rejection-recovery timeout
 - NWU (X north, Y west, Z up) Earth convention
+
+The LSM6DSV320X low-g accelerometer now feeds the LPF1 output directly and the
+gyro LPF1 uses its ultra-light setting.  This removes the stronger filters used
+by the original IMU test and reduces angle-to-light latency.
 
 TIM2 runs at 1 MHz and measures the actual time between synchronized
 accelerometer/gyroscope samples.  Implausible intervals caused by a debugger

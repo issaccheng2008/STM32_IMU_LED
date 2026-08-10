@@ -1,67 +1,77 @@
-#include "../firmware/pov_file.h"
+#include "wand_file.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-
-typedef struct {
-    uint8_t *data;
-    uint32_t length;
-} memory_file_t;
-
-static bool read_at(void *context, uint32_t offset, uint8_t *destination, uint32_t length)
-{
-    memory_file_t *file = (memory_file_t *)context;
-    if ((offset > file->length) || (length > file->length - offset)) {
-        return false;
-    }
-    memcpy(destination, &file->data[offset], length);
-    return true;
-}
 
 static int fail(const char *message)
 {
-    fprintf(stderr, "FAIL: %s\n", message);
-    return 1;
+  fprintf(stderr, "FAIL: %s\n", message);
+  return 1;
 }
 
 int main(void)
 {
-    FILE *input;
-    long file_length;
-    memory_file_t file;
-    pov1_header_t header;
-    uint8_t scratch[7];
-    uint8_t rgb[6];
-    uint8_t spi[16];
-    uint32_t spi_length = 0u;
+  FILE *input;
+  long file_length;
+  uint8_t *file_bytes;
+  wand1_header_t header;
+  const uint8_t *payload;
 
-    input = fopen("tests/fixture.pov", "rb");
-    if (input == NULL) return fail("could not open fixture.pov");
-    if (fseek(input, 0, SEEK_END) != 0) return fail("seek failed");
-    file_length = ftell(input);
-    if ((file_length <= 0) || ((unsigned long)file_length > UINT32_MAX)) return fail("bad fixture size");
-    if (fseek(input, 0, SEEK_SET) != 0) return fail("rewind failed");
-    file.length = (uint32_t)file_length;
-    file.data = (uint8_t *)malloc(file.length);
-    if (file.data == NULL) return fail("allocation failed");
-    if (fread(file.data, 1u, file.length, input) != file.length) return fail("read failed");
-    fclose(input);
+  input = fopen("tests/fixture.pov", "rb");
+  if (input == NULL)
+    return fail("could not open fixture.pov");
+  if (fseek(input, 0, SEEK_END) != 0)
+    return fail("seek failed");
+  file_length = ftell(input);
+  if ((file_length <= 0) || ((unsigned long)file_length > UINT32_MAX))
+    return fail("bad fixture size");
+  if (fseek(input, 0, SEEK_SET) != 0)
+    return fail("rewind failed");
 
-    if (pov1_read_header(read_at, &file, &header) != POV_OK) return fail("header validation failed");
-    if ((header.led_count != 2u) || (header.sample_count != 8u)) return fail("header values differ");
-    if (pov1_validate_payload_crc(read_at, &file, &header, scratch, sizeof(scratch)) != POV_OK) return fail("payload CRC failed");
-    if (pov1_angle_to_sample(&header, 45000000u) != 1u) return fail("angle lookup failed");
-    if (pov1_read_rgb_frame(read_at, &file, &header, 1u, rgb, sizeof(rgb)) != POV_OK) return fail("frame read failed");
-    if ((rgb[0] != 0x12u) || (rgb[1] != 0x34u) || (rgb[2] != 0x56u)) return fail("RGB values differ");
-    if (pov1_build_sk9822_frame(&header, rgb, sizeof(rgb), POV1_USE_HEADER_BRIGHTNESS,
-                                spi, sizeof(spi), &spi_length) != POV_OK) return fail("SK9822 build failed");
-    if (spi_length != sizeof(spi)) return fail("SK9822 length differs");
-    if ((spi[4] != 0xE3u) || (spi[5] != 0x34u) || (spi[6] != 0x12u) || (spi[7] != 0x56u)) {
-        return fail("SK9822 byte order differs");
-    }
+  file_bytes = (uint8_t *)malloc((size_t)file_length);
+  if (file_bytes == NULL)
+    return fail("allocation failed");
+  if (fread(file_bytes, 1U, (size_t)file_length, input) !=
+      (size_t)file_length)
+  {
+    return fail("read failed");
+  }
+  fclose(input);
 
-    free(file.data);
-    puts("JavaScript-to-C POV1 compatibility test passed.");
-    return 0;
+  if (WAND_ParseHeader(file_bytes, (uint32_t)file_length, &header) != WAND_OK)
+    return fail("C parser rejected the JavaScript header");
+  if ((header.led_count != 35U) ||
+      (header.sample_count != 5U) ||
+      (header.frame_bytes != 148U))
+  {
+    return fail("header values differ");
+  }
+
+  payload = &file_bytes[WAND1_HEADER_BYTES];
+  if (WAND_ValidatePayload(&header, payload, header.payload_bytes) != WAND_OK)
+    return fail("C parser rejected the JavaScript payload");
+  if ((payload[4] != 0xE3U) || (payload[5] != 0x34U) ||
+      (payload[6] != 0x12U) || (payload[7] != 0x56U))
+  {
+    return fail("direct SK9822 command bytes differ");
+  }
+
+  if ((WAND_AngleToSample(&header, -90000) != 0U) ||
+      (WAND_AngleToSample(&header, 0) != 2U) ||
+      (WAND_AngleToSample(&header, 90000) != 4U))
+  {
+    return fail("angle lookup differs");
+  }
+
+  if ((WAND_RollToAngleMdeg(-90000) != 0) ||
+      (WAND_RollToAngleMdeg(0) != -90000) ||
+      (WAND_RollToAngleMdeg(-180000) != 90000))
+  {
+    return fail("roll-to-wand mapping differs");
+  }
+
+  free(file_bytes);
+  puts("JavaScript-to-STM32 WAND1 compatibility test passed.");
+  return 0;
 }

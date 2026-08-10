@@ -10,9 +10,6 @@
     conversion: null,
     currentView: "reconstruction",
     selectedSample: 0,
-    playing: false,
-    animationHandle: 0,
-    lastAnimationTime: 0,
     renderTransform: null,
     mapRect: null,
     drag: null,
@@ -31,8 +28,7 @@
   function readConfig() {
     const config = {};
     configInputs.forEach((input) => {
-      if (input.dataset.config === "clockwise") config.clockwise = input.value === "true";
-      else if (input.type === "number" || input.type === "range") config[input.dataset.config] = Number(input.value);
+      if (input.type === "number" || input.type === "range") config[input.dataset.config] = Number(input.value);
       else config[input.dataset.config] = input.value;
     });
     return config;
@@ -81,7 +77,7 @@
     g.fillText("POV", cx, cy + 8);
     g.fillStyle = "#090b0d";
     g.font = "700 29px monospace";
-    g.fillText("35 PIXELS / 360°", cx, cy + 142);
+    g.fillText("35 PIXELS / -90°…+90°", cx, cy + 142);
     finishSource("built-in-test-image.png");
   }
 
@@ -132,8 +128,11 @@
   function runConversion() {
     if (!state.sourceImageData) return;
     try {
+      const selectedAngle = state.conversion
+        ? Core.angleForSample(state.conversion.config, state.selectedSample)
+        : 0;
       state.conversion = Core.convertImage(state.sourceImageData, readConfig());
-      state.selectedSample %= state.conversion.config.sampleCount;
+      state.selectedSample = Core.sampleForAngle(state.conversion.config, selectedAngle);
       updateReadouts();
       drawPreview();
       renderLedStrip();
@@ -160,7 +159,7 @@
     document.getElementById("frameCount").textContent = config.sampleCount.toLocaleString();
     document.getElementById("actualStep").textContent = `${config.actualStepDeg.toFixed(6)}°`;
     document.getElementById("sampleCount").textContent = conversion.totalLedSamples.toLocaleString();
-    document.getElementById("payloadSize").textContent = formatBytes(conversion.payload.length);
+    document.getElementById("payloadSize").textContent = formatBytes(Core.HEADER_BYTES + conversion.payload.length);
     document.getElementById("litPercent").textContent = `${(100 * conversion.litSamples / Math.max(1, conversion.totalLedSamples)).toFixed(1)}%`;
     document.getElementById("ledPitchReadout").textContent = `${config.ledPitchCm.toFixed(3)} cm`;
     document.getElementById("rgbBrightnessOutput").textContent = `${Math.round(config.rgbBrightnessPercent)}%`;
@@ -171,39 +170,72 @@
     const adjustment = document.getElementById("stepAdjustment");
     if (Math.abs(config.requestedStepDeg - config.actualStepDeg) > 0.000001) {
       adjustment.hidden = false;
-      adjustment.textContent = `Adjusted ${config.requestedStepDeg}° to ${config.actualStepDeg.toFixed(6)}° so one revolution contains exactly ${config.sampleCount} whole frames.`;
+      adjustment.textContent = `Adjusted ${config.requestedStepDeg}° to ${config.actualStepDeg.toFixed(6)}° so the 180° sweep has whole intervals and includes both endpoints.`;
     } else adjustment.hidden = true;
 
     updateRuntimeEstimate();
     updateAngleLabel();
   }
 
+  function calculateRuntimeEstimate(config) {
+    const cyclesPerSecond = Math.max(0, numberValue("waveCyclesPerSecond") || 0);
+    const waveAngleDeg = Math.min(90, Math.max(0, numberValue("waveAngleDeg") || 0));
+    const spiMhz = Math.max(.1, numberValue("spiMhz") || .1);
+    const updatesPerSecond = 4 * waveAngleDeg * cyclesPerSecond / config.actualStepDeg;
+    const peakUpdatesPerSecond = 2 * Math.PI * waveAngleDeg * cyclesPerSecond / config.actualStepDeg;
+    const peakAngularRateDps = 2 * Math.PI * waveAngleDeg * cyclesPerSecond;
+    const peakLedBytesPerSecond = peakUpdatesPerSecond * config.frameBytes;
+    const busUse = peakLedBytesPerSecond * 8 / (spiMhz * 1000000) * 100;
+    return {
+      cyclesPerSecond,
+      waveAngleDeg,
+      spiMhz,
+      updatesPerSecond,
+      peakUpdatesPerSecond,
+      peakAngularRateDps,
+      peakLedBytesPerSecond,
+      busUse,
+    };
+  }
+
   function updateRuntimeEstimate() {
     if (!state.conversion) return;
-    const config = state.conversion.config;
-    const rpm = Math.max(0, numberValue("rpm") || 0);
-    const spiMhz = Math.max(.1, numberValue("spiMhz") || .1);
-    const updatesPerSecond = rpm / 60 * config.sampleCount;
-    const rgbBytesPerSecond = updatesPerSecond * config.ledCount * 3;
-    const sk9822BytesPerFrame = 4 + config.ledCount * 4 + 4;
-    const busUse = updatesPerSecond * sk9822BytesPerFrame * 8 / (spiMhz * 1000000) * 100;
+    const estimate = calculateRuntimeEstimate(state.conversion.config);
+    const {
+      updatesPerSecond,
+      peakUpdatesPerSecond,
+      peakAngularRateDps,
+      peakLedBytesPerSecond,
+      busUse,
+    } = estimate;
     document.getElementById("updatesPerSecond").textContent = updatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 });
-    document.getElementById("sdRate").textContent = formatRate(rgbBytesPerSecond);
+    document.getElementById("peakUpdatesPerSecond").textContent = peakUpdatesPerSecond.toLocaleString(undefined, { maximumFractionDigits: 0 });
+    document.getElementById("peakLedDataRate").textContent = formatRate(peakLedBytesPerSecond);
+    document.getElementById("startupRead").textContent = formatBytes(Core.HEADER_BYTES + state.conversion.payload.length);
+    document.getElementById("peakAngularRate").textContent = `${peakAngularRateDps.toLocaleString(undefined, { maximumFractionDigits: 0 })} °/s`;
     document.getElementById("busUse").textContent = `${busUse.toFixed(1)}%`;
     const bar = document.getElementById("performanceBar");
     bar.style.width = `${Math.min(100, busUse)}%`;
     const status = document.getElementById("performanceStatus");
-    if (busUse > 100) {
+    if (peakAngularRateDps > 4000) {
       bar.style.background = "var(--danger)";
-      status.textContent = "The selected SPI clock cannot transmit every requested angle frame at this RPM.";
+      status.textContent = "This wave exceeds the firmware's ±4000 °/s gyro range. Reduce cycles/second or wave angle.";
       status.style.color = "var(--danger)";
+    } else if (busUse > 100) {
+      bar.style.background = "var(--danger)";
+      status.textContent = "The selected SPI clock cannot transmit the peak angle-frame rate.";
+      status.style.color = "var(--danger)";
+    } else if (peakUpdatesPerSecond > 1920) {
+      bar.style.background = "var(--amber)";
+      status.textContent = "The LED bus fits, but the 1,920 Hz orientation loop may skip some angle bins near the middle of the wave.";
+      status.style.color = "var(--amber)";
     } else if (busUse > 80) {
       bar.style.background = "var(--amber)";
-      status.textContent = "Timing fits, with little margin. Buffer SD reads and use SPI DMA.";
+      status.textContent = "Timing fits with little SPI margin.";
       status.style.color = "var(--amber)";
     } else {
       bar.style.background = "var(--lime)";
-      status.textContent = "The LED bus has comfortable timing margin at these settings.";
+      status.textContent = "The 1,920 Hz orientation loop and LED bus both cover this motion estimate.";
       status.style.color = "var(--muted)";
     }
   }
@@ -296,9 +328,13 @@
     ctx.lineWidth = Math.max(1, canvas.width / 1300);
     const stride = Math.max(1, Math.ceil(config.ledCount / 12));
     for (let led = 0; led < config.ledCount; led += stride) {
-      const radius = Math.abs(Core.radiusForLed(config, led)) * transform.scale;
       ctx.beginPath();
-      ctx.arc(transform.cx, transform.cy, radius, 0, Math.PI * 2);
+      for (let sample = 0; sample < config.sampleCount; sample += 1) {
+        const world = Core.ledWorldPosition(config, sample, led);
+        const point = toCanvas(transform, world.x, world.y);
+        if (sample === 0) ctx.moveTo(point.x, point.y);
+        else ctx.lineTo(point.x, point.y);
+      }
       ctx.stroke();
     }
     ctx.restore();
@@ -388,7 +424,7 @@
     ctx.drawImage(offscreen, rect.x, rect.y, rect.width, rect.height);
     ctx.strokeStyle = "#46515a";
     ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
-    const selectedX = rect.x + state.selectedSample / config.sampleCount * rect.width;
+    const selectedX = rect.x + state.selectedSample / (config.sampleCount - 1) * rect.width;
     ctx.strokeStyle = "#f4f7ef";
     ctx.lineWidth = Math.max(1, canvas.width / 800);
     ctx.beginPath();
@@ -398,8 +434,8 @@
     ctx.fillStyle = "#89939b";
     ctx.font = `${Math.max(9, canvas.width / 90)}px monospace`;
     ctx.textAlign = "center";
-    [0, 90, 180, 270, 360].forEach((angle) => {
-      const x = rect.x + angle / 360 * rect.width;
+    [-90, -45, 0, 45, 90].forEach((angle) => {
+      const x = rect.x + (angle - config.minAngleDeg) / (config.maxAngleDeg - config.minAngleDeg) * rect.width;
       ctx.fillText(`${angle}°`, x, rect.y + rect.height + 24);
     });
     ctx.save();
@@ -457,7 +493,7 @@
 
   function updateAngleLabel() {
     if (!state.conversion) return;
-    const angle = state.selectedSample * state.conversion.config.actualStepDeg;
+    const angle = Core.angleForSample(state.conversion.config, state.selectedSample);
     document.getElementById("selectedAngleLabel").textContent = `${angle.toFixed(3)}°`;
     document.getElementById("angleSlider").value = String(state.selectedSample);
   }
@@ -465,29 +501,9 @@
   function selectSample(sample) {
     if (!state.conversion) return;
     const count = state.conversion.config.sampleCount;
-    state.selectedSample = ((Math.round(sample) % count) + count) % count;
+    state.selectedSample = Math.min(count - 1, Math.max(0, Math.round(sample)));
     renderLedStrip();
     drawPreview();
-  }
-
-  function animationFrame(time) {
-    if (!state.playing || !state.conversion) return;
-    if (time - state.lastAnimationTime > 32) {
-      const increment = Math.max(1, Math.round(state.conversion.config.sampleCount / 180));
-      selectSample(state.selectedSample + increment);
-      state.lastAnimationTime = time;
-    }
-    state.animationHandle = requestAnimationFrame(animationFrame);
-  }
-
-  function togglePlay() {
-    state.playing = !state.playing;
-    document.getElementById("playIcon").textContent = state.playing ? "■" : "▶";
-    document.getElementById("playButton").lastChild.textContent = state.playing ? " Stop" : " Animate";
-    if (state.playing) {
-      state.lastAnimationTime = 0;
-      state.animationHandle = requestAnimationFrame(animationFrame);
-    } else cancelAnimationFrame(state.animationHandle);
   }
 
   function pointerToCanvas(event) {
@@ -514,7 +530,7 @@
     if (state.currentView === "map" && state.mapRect) {
       const rect = state.mapRect;
       if (point.x >= rect.x && point.x <= rect.x + rect.width) {
-        selectSample((point.x - rect.x) / rect.width * state.conversion.config.sampleCount);
+        selectSample((point.x - rect.x) / rect.width * (state.conversion.config.sampleCount - 1));
       }
       return;
     }
@@ -553,25 +569,30 @@
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
-  function safeBaseName() {
-    const input = document.getElementById("fileName");
-    const cleaned = input.value.trim().replace(/\.[^.]+$/, "").replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
-    return cleaned || "pov_image";
-  }
-
   function downloadPov() {
     if (!state.conversion) return;
-    const bytes = Core.buildPovBinary(state.conversion);
-    downloadBlob(new Blob([bytes], { type: "application/octet-stream" }), `${safeBaseName()}.pov`);
-    showToast(`Exported ${formatBytes(bytes.length)} POV1 binary`);
+    const bytes = Core.buildWandBinary(state.conversion);
+    downloadBlob(new Blob([bytes], { type: "application/octet-stream" }), "WAND.POV");
+    showToast(`Exported ${formatBytes(bytes.length)} WAND1 binary`);
   }
 
   function downloadJson() {
     if (!state.conversion) return;
-    const data = Core.buildJsonExport(state.conversion, state.sourceName);
+    const estimate = calculateRuntimeEstimate(state.conversion.config);
+    const data = Core.buildJsonExport(state.conversion, state.sourceName, {
+      cycles_per_second: estimate.cyclesPerSecond,
+      maximum_deviation_deg: estimate.waveAngleDeg,
+      average_frame_changes_per_second: estimate.updatesPerSecond,
+      peak_frame_changes_per_second: estimate.peakUpdatesPerSecond,
+      peak_angular_rate_deg_per_second: estimate.peakAngularRateDps,
+      peak_led_bytes_per_second: estimate.peakLedBytesPerSecond,
+      spi_clock_mhz: estimate.spiMhz,
+      peak_spi_bus_use_percent: estimate.busUse,
+      firmware_orientation_rate_hz: 1920,
+    });
     const text = JSON.stringify(data, null, 2);
-    downloadBlob(new Blob([text], { type: "application/json" }), `${safeBaseName()}.json`);
-    showToast("Exported human-readable angle and RGB check file");
+    downloadBlob(new Blob([text], { type: "application/json" }), "WAND.json");
+    showToast("Exported the human-readable SK9822 command translation");
   }
 
   function showToast(message, error) {
@@ -594,13 +615,13 @@
     input.addEventListener("change", () => scheduleConversion(false));
   });
 
-  document.getElementById("rpm").addEventListener("input", updateRuntimeEstimate);
+  document.getElementById("waveCyclesPerSecond").addEventListener("input", updateRuntimeEstimate);
+  document.getElementById("waveAngleDeg").addEventListener("input", updateRuntimeEstimate);
   document.getElementById("spiMhz").addEventListener("input", updateRuntimeEstimate);
   document.getElementById("showSource").addEventListener("change", drawPreview);
   document.getElementById("loadDemoButton").addEventListener("click", makeDemoImage);
   document.getElementById("imageInput").addEventListener("change", (event) => loadImageFile(event.target.files[0]));
   document.getElementById("angleSlider").addEventListener("input", (event) => selectSample(Number(event.target.value)));
-  document.getElementById("playButton").addEventListener("click", togglePlay);
   document.getElementById("downloadPov").addEventListener("click", downloadPov);
   document.getElementById("downloadJson").addEventListener("click", downloadJson);
 

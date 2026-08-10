@@ -1,100 +1,140 @@
-# POV LED Image Converter
+# POV wand image converter
 
-An offline, browser-based converter for turning an ordinary image into angle-indexed RGB commands for a rotating LED strip. The defaults match this project:
+This offline browser tool converts an image into angle-indexed commands for the
+35-pixel SK9822 strip in the STM32 IMU POV wand.  It models a hand-held sweep,
+not a continuously rotating fan.
 
-- 35 full-color SK9822 LEDs
-- 25 cm LED-center span
-- adjustable pivot-to-LED-0 distance
-- adjustable image position, physical size, and rotation
-- adjustable angular interval (1°, 0.5°, 0.1°, and other values)
-- binary output intended for an STM32H743 reading from microSD
+## What changed from the fan converter
 
-## Run it
+- The mechanical range is fixed to **-90° through +90°**, including both
+  endpoints.  Upright is 0°, counterclockwise is negative, and clockwise is
+  positive.
+- LED count is fixed at 35 to match the firmware and tested strip.
+- Rotation direction, hardware zero-angle, RPM, full-turn wrapping, and the
+  animation control were removed.  They do not describe a back-and-forth wand.
+- `pivot → LED 0` remains because the hand/arm pivot changes where every LED
+  samples the source image.
+- The app adds **cycles per second** (default 10) and **wave angle** (default
+  ±35°) to estimate average/peak frame changes, peak angular rate, and LED-bus
+  use.
+- The binary payload stores complete SK9822 wire frames instead of RGB triples.
+  The STM32 can transmit a selected frame without rearranging or expanding it.
+- Every binary export is accompanied by an optional human-readable JSON export
+  with the exact wire bytes and decoded brightness/RGB values.
+- The binary filename is fixed to `WAND.POV`, matching the firmware's read-only
+  FAT filesystem.  Converter-only geometry and motion estimates remain in
+  `WAND.json`; they are not needed during playback.
 
-There are **no dependencies to install**. The tool does not upload the selected image and does not need an internet connection.
+## Run the app
 
-1. Extract the project folder.
-2. Double-click `index.html`.
-3. If your browser blocks local scripts (most current browsers do not), run a local server from this folder with either:
+For development:
 
-   ```sh
-   python -m http.server 8080
-   ```
+```sh
+npm ci
+npm run dev
+```
 
-   or:
+Open the URL printed by Vite.  For a production bundle, run `npm run build` and
+serve the `dist/` directory.  You can also open `index.html` directly in modern
+browsers.  Image processing stays in the browser and no file is uploaded.
 
-   ```sh
-   python3 -m http.server 8080
-   ```
+## Workflow
 
-4. Open `http://localhost:8080`.
-
-Python is only needed for the optional fallback server. Node.js is only needed to run the developer tests.
+1. Load an image.
+2. Enter the strip length and signed pivot-to-LED-0 distance.
+3. Position, size, and rotate the source image, or drag it in the preview.
+4. Choose the requested angle interval.  The app adjusts it slightly when
+   necessary so an integer number of intervals covers exactly 180°.
+5. Set the planned cycles/second and maximum wave deviation to inspect timing.
+6. Check the reconstruction, angle × LED map, and individual LED frame.
+7. Download `WAND.POV` and the translated `WAND.json`.
+8. Copy `WAND.POV` to the root of a FAT32 microSD card.
 
 ## Coordinate model
 
-- The **pivot** is the origin `(0, 0)`.
-- `+X` is right; `+Y` is above the pivot.
-- LED 0 is the LED nearest the lower end of the strip.
-- `pivot → LED 0` is signed. A positive value puts LED 0 above the pivot. A negative value means the pivot lies above LED 0.
-- The strip length is the LED-center distance from LED 0 to the last LED. With the defaults, pitch is `25 cm / (35 - 1) = 0.735294 cm`.
-- Hardware angle 0° points upward by default. Its direction and the direction of increasing mechanical angle are configurable.
-- Image position is its center, measured relative to the pivot.
+- The arm/hand pivot is `(0, 0)`.
+- `+X` is right and `+Y` is above the pivot.
+- Wand angle 0° points straight up.
+- Negative angles move counterclockwise/left; positive angles move
+  clockwise/right.
+- LED 0 is the pixel nearest the handle end.
+- `pivot → LED 0` is signed.  A positive value puts LED 0 along the wand above
+  the pivot; a negative value places the pivot beyond LED 0.
+- Strip length is the LED-center distance from LED 0 to LED 34.  At 25 cm, the
+  pitch is `25 / 34 = 0.735294 cm`.
 
-At each angle, the converter calculates every LED center's world position, transforms it into the image's coordinate system, and samples the image. Samples outside the image and transparent pixels become black.
+For an LED with radius `r` and wand angle `θ`:
 
-## Typical workflow
+```text
+x = r × sin(θ)
+y = r × cos(θ)
+```
 
-1. Load an image.
-2. Enter the physical strip dimensions and pivot offset.
-3. Position and size the image numerically or drag it in the preview.
-4. Choose the angular interval.
-5. Inspect the reconstructed image, the angle × LED heatmap, and individual angle frames.
-6. Enter the planned RPM and SPI clock to check whether the SK9822 bus is fast enough.
-7. Export the `.pov` binary for the microSD card.
+The point is transformed into the configured source-image rectangle and
+sampled with nearest-neighbor or bilinear interpolation.  Transparent and
+out-of-bounds pixels become black.
 
-The JSON export is intended for debugging and verification. It is much larger and should not normally be used by the STM32.
+## Sampling and memory limits
+
+The requested interval is clamped to 0.1°–45°.  The app uses:
+
+```text
+interval_count = round(180° / requested_interval)
+actual_interval = 180° / interval_count
+sample_count = interval_count + 1
+```
+
+This gives 5–1,801 frames and always stores both -90° and +90°.  Every frame is
+148 bytes, so the finest 0.1° grid produces a 266,548-byte payload plus the
+48-byte header.  This is the largest file the firmware's preload buffer accepts
+and fits in STM32H743 RAM_D1.
+
+## Motion estimates
+
+The estimator assumes sinusoidal motion with maximum deviation `A` degrees and
+frequency `f` complete left→right→left cycles per second:
+
+```text
+average frame changes/s = 4 × A × f / angle_interval
+peak frame changes/s    = 2π × A × f / angle_interval
+peak angular rate       = 2π × A × f degrees/s
+peak SPI use            = peak frame changes/s × 148 × 8 / SPI_bit_rate
+```
+
+The default 10 Hz, ±35° wave peaks near 2,199°/s, which is why the STM32 uses
+the LSM6DSV320X ±4,000 dps range.  The estimate is a planning bound: the
+firmware sends only when a new orientation estimate selects a different frame.
 
 ## Output files
 
-The compact `.pov` file is:
+`WAND.POV` is the compact, CRC-protected runtime file:
 
 ```text
-80-byte POV1 header
-frame 0: LED 0 RGB, LED 1 RGB, ... LED N RGB
-frame 1: LED 0 RGB, LED 1 RGB, ... LED N RGB
+48-byte WAND1 header
+frame -90°: 00 00 00 00 + 35 × [111BBBBB,G,R,B] + FF FF FF FF
+next angle frame
 ...
+frame +90°
 ```
 
-Each frame is contiguous, so firmware can seek to one angle without parsing earlier frames:
+`WAND.json` is the readable translation.  Each frame contains:
 
-```text
-frame_offset = 80 + angle_index * led_count * 3
-```
+- its wand angle;
+- the complete 148-byte wire frame as hexadecimal;
+- all 35 LED commands as global brightness, RGB, and four SK9822 bytes;
+- source geometry, sampling settings, and the motion estimate.
 
-See [docs/FILE_FORMAT.md](docs/FILE_FORMAT.md) for the complete specification and [firmware/pov_file.c](firmware/pov_file.c) for a portable STM32-oriented decoder.
+See [docs/FILE_FORMAT.md](docs/FILE_FORMAT.md) for the byte-level contract.  The
+matching STM32 implementation is in `Core/Inc/wand_file.h` and
+`Core/Src/wand_file.c` at the repository root.
 
-## SK9822 note
-
-The `.pov` payload stores ordinary **RGB**. Your supplied SK9822 specification expects each physical pixel as:
-
-```text
-0xE0 | global_brightness, green, red, blue
-```
-
-The included firmware helper performs this RGB-to-GRB packaging. Keeping the disk file as RGB makes it easier to inspect and reuse.
-
-## Timing note
-
-The converter's runtime estimator includes the SK9822 start frame, 4 bytes per LED, and end frame. A setting can generate valid image data but still demand more LED updates than the selected SPI clock can transmit. For firmware, use buffered SD reads and SPI DMA; do not perform a separate filesystem seek for every LED.
-
-## Developer tests
-
-With Node.js 18 or newer installed:
+## Tests
 
 ```sh
-node tests/test-core.js
+npm test
+npm run build
 ```
 
-The test suite checks geometry, pixel sampling, binary layout, CRCs, and payload round-tripping. There are no npm packages to install.
-
+The test suite checks geometry, angle endpoints, image sampling, direct SK9822
+byte order, both CRCs, JSON translation, and compatibility between the
+JavaScript writer and the exact pure-C parser used by the firmware.
