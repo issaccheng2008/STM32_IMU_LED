@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.o
+tests/fixture.pov
+tests/test-firmware

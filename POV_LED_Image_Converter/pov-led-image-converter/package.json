@@ -1,0 +1,14 @@
+{
+  "name": "pov-led-image-converter",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Offline radial image sampler and POV1 exporter for rotating LED strips",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "node tests/test-core.js"
+  },
+  "devDependencies": {
+    "vite": "^7.1.1"
+  }
+}

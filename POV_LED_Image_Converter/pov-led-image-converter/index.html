@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="Offline image-to-POV LED command converter for a rotating 35-pixel SK9822 strip." />
+    <title>POV LED Image Converter</title>
+    <link rel="stylesheet" href="src/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div>
+          <p class="eyebrow">ROTARY LIGHT LAB / OFFLINE TOOL</p>
+          <h1>POV LED Image Converter</h1>
+        </div>
+      </div>
+      <div class="header-status">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span>LOCAL · NO UPLOADS</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="control-panel" aria-label="Conversion settings">
+        <section class="panel-section source-section">
+          <div class="section-heading">
+            <span class="step-index">01</span>
+            <div><h2>Source image</h2><p>PNG, JPEG, WebP, GIF or BMP</p></div>
+          </div>
+          <label class="drop-zone" id="dropZone" for="imageInput">
+            <input id="imageInput" type="file" accept="image/*" />
+            <span class="drop-icon" aria-hidden="true">＋</span>
+            <strong id="sourceName">Drop an image here</strong>
+            <span>or click to choose a file</span>
+          </label>
+          <button type="button" class="text-button" id="loadDemoButton">Reload built-in test image</button>
+        </section>
+
+        <section class="panel-section">
+          <div class="section-heading">
+            <span class="step-index">02</span>
+            <div><h2>Rotating strip</h2><p>Distances are LED-center to LED-center</p></div>
+          </div>
+          <div class="field-grid two-column">
+            <label class="field"><span>LED count</span><input id="ledCount" data-config="ledCount" type="number" min="1" max="1024" step="1" value="35" /></label>
+            <label class="field"><span>Strip length <em>cm</em></span><input id="stripLengthCm" data-config="stripLengthCm" type="number" min="0" step="0.1" value="25" /></label>
+          </div>
+          <label class="field wide"><span>Pivot → LED 0 <em>cm</em></span><input id="pivotOffsetCm" data-config="pivotOffsetCm" type="number" step="0.1" value="0" /><small>Positive: pivot below LED 0. Negative: pivot is farther up the strip.</small></label>
+          <div class="field-grid two-column">
+            <label class="field"><span>Angle interval <em>°</em></span><input id="requestedStepDeg" data-config="requestedStepDeg" type="number" min="0.05" max="45" step="0.05" value="1" /></label>
+            <label class="field"><span>Direction</span><select id="clockwise" data-config="clockwise"><option value="true">Clockwise</option><option value="false">Counterclockwise</option></select></label>
+          </div>
+          <label class="field wide"><span>Hardware 0° direction <em>° clockwise from up</em></span><input id="zeroAngleDeg" data-config="zeroAngleDeg" type="number" step="0.1" value="0" /></label>
+          <div class="derived-row"><span>LED pitch</span><strong id="ledPitchReadout">0.735 cm</strong></div>
+        </section>
+
+        <section class="panel-section">
+          <div class="section-heading">
+            <span class="step-index">03</span>
+            <div><h2>Image placement</h2><p>Relative to the rotation pivot</p></div>
+          </div>
+          <div class="coordinate-note"><span class="axis-x">+X right</span><span class="axis-y">+Y above pivot</span></div>
+          <div class="field-grid two-column">
+            <label class="field"><span>Center X <em>cm</em></span><input id="imageCenterXCm" data-config="imageCenterXCm" type="number" step="0.1" value="0" /></label>
+            <label class="field"><span>Center Y <em>cm</em></span><input id="imageCenterYCm" data-config="imageCenterYCm" type="number" step="0.1" value="12.5" /></label>
+            <label class="field"><span>Width <em>cm</em></span><input id="imageWidthCm" data-config="imageWidthCm" type="number" min="0.001" step="0.1" value="22" /></label>
+            <label class="field"><span>Height <em>cm</em></span><input id="imageHeightCm" data-config="imageHeightCm" type="number" min="0.001" step="0.1" value="22" /></label>
+          </div>
+          <label class="check-row"><input id="lockAspect" type="checkbox" checked /><span>Lock source aspect ratio</span></label>
+          <label class="field wide"><span>Image rotation <em>° clockwise</em></span><input id="imageRotationDeg" data-config="imageRotationDeg" type="number" step="0.1" value="0" /></label>
+          <p class="drag-hint">Tip: drag the translucent image directly in the preview.</p>
+        </section>
+
+        <section class="panel-section">
+          <div class="section-heading">
+            <span class="step-index">04</span>
+            <div><h2>Color output</h2><p>RGB payload; firmware sends SK9822 as G-R-B</p></div>
+          </div>
+          <div class="field-grid two-column">
+            <label class="field"><span>Sampling</span><select id="interpolation" data-config="interpolation"><option value="bilinear">Bilinear</option><option value="nearest">Nearest</option></select></label>
+            <label class="field"><span>Global brightness <em>0–31</em></span><input id="globalBrightness" data-config="globalBrightness" type="number" min="0" max="31" step="1" value="1" /></label>
+          </div>
+          <label class="range-field"><span>RGB brightness</span><output id="rgbBrightnessOutput">100%</output><input id="rgbBrightnessPercent" data-config="rgbBrightnessPercent" type="range" min="0" max="100" step="1" value="100" /></label>
+        </section>
+      </aside>
+
+      <section class="preview-column">
+        <div class="preview-toolbar">
+          <div class="view-tabs" role="tablist" aria-label="Preview mode">
+            <button type="button" class="view-tab active" data-view="reconstruction" role="tab">POV reconstruction</button>
+            <button type="button" class="view-tab" data-view="map" role="tab">Angle × LED map</button>
+            <button type="button" class="view-tab" data-view="geometry" role="tab">Source geometry</button>
+          </div>
+          <label class="check-row compact"><input id="showSource" type="checkbox" checked /><span>Source overlay</span></label>
+        </div>
+
+        <div class="canvas-shell" id="canvasShell">
+          <canvas id="previewCanvas" width="920" height="760" aria-label="POV conversion preview"></canvas>
+          <div class="canvas-legend" id="canvasLegend"><span><i class="legend-pivot"></i>Pivot</span><span><i class="legend-ray"></i>Selected angle</span><span><i class="legend-source"></i>Source bounds</span></div>
+          <div class="canvas-message" id="canvasMessage">Drag image to position it</div>
+        </div>
+
+        <section class="timeline-panel">
+          <div class="timeline-topline">
+            <div>
+              <p class="eyebrow">ANGLE INSPECTOR</p>
+              <h2 id="selectedAngleLabel">0.000°</h2>
+            </div>
+            <button type="button" class="play-button" id="playButton" aria-label="Play angle animation"><span id="playIcon">▶</span> Animate</button>
+          </div>
+          <input id="angleSlider" class="angle-slider" type="range" min="0" max="359" step="1" value="0" aria-label="Selected angle sample" />
+          <div class="angle-scale"><span>0°</span><span>90°</span><span>180°</span><span>270°</span><span>360°</span></div>
+          <div class="led-strip" id="ledStrip" aria-label="Colors for every LED at the selected angle"></div>
+          <div class="strip-labels"><span>LED 0 · nearest</span><span id="outerLedLabel">LED 34 · farthest</span></div>
+        </section>
+      </section>
+
+      <aside class="output-panel" aria-label="Output and performance">
+        <section class="output-summary">
+          <p class="eyebrow">CONVERSION READY</p>
+          <div class="summary-number"><strong id="frameCount">360</strong><span>angle frames</span></div>
+          <dl class="summary-grid">
+            <div><dt>Actual interval</dt><dd id="actualStep">1.000000°</dd></div>
+            <div><dt>LED samples</dt><dd id="sampleCount">12,600</dd></div>
+            <div><dt>RGB payload</dt><dd id="payloadSize">36.9 KiB</dd></div>
+            <div><dt>Lit samples</dt><dd id="litPercent">—</dd></div>
+          </dl>
+          <p class="adjustment-note" id="stepAdjustment" hidden></p>
+        </section>
+
+        <section class="output-section">
+          <div class="section-heading small">
+            <span class="step-index">05</span>
+            <div><h2>Runtime estimate</h2><p>Checks update timing before firmware work</p></div>
+          </div>
+          <div class="field-grid two-column">
+            <label class="field"><span>Speed <em>RPM</em></span><input id="rpm" type="number" min="0" step="10" value="1000" /></label>
+            <label class="field"><span>SPI clock <em>MHz</em></span><input id="spiMhz" type="number" min="0.1" max="30" step="0.5" value="8" /></label>
+          </div>
+          <dl class="performance-list">
+            <div><dt>LED updates / second</dt><dd id="updatesPerSecond">6,000</dd></div>
+            <div><dt>SD payload stream</dt><dd id="sdRate">615 KiB/s</dd></div>
+            <div><dt>SK9822 bus use</dt><dd id="busUse">88.8%</dd></div>
+          </dl>
+          <div class="performance-meter"><span id="performanceBar"></span></div>
+          <p class="performance-status" id="performanceStatus">Timing fits, with little margin.</p>
+        </section>
+
+        <section class="output-section export-section">
+          <div class="section-heading small">
+            <span class="step-index">06</span>
+            <div><h2>Export</h2><p>Angle-major raw RGB for microSD</p></div>
+          </div>
+          <label class="field wide"><span>File name</span><input id="fileName" type="text" value="image_35led_1deg" /></label>
+          <button type="button" class="primary-button" id="downloadPov"><span>↓</span> Download STM32 binary <kbd>.pov</kbd></button>
+          <button type="button" class="secondary-button" id="downloadJson">Download readable check file <kbd>.json</kbd></button>
+          <div class="format-note">
+            <strong>POV1 · little-endian · CRC32</strong>
+            <span>80-byte header + <code>angle → LED → R,G,B</code></span>
+          </div>
+        </section>
+
+        <section class="output-section how-it-works">
+          <h2>What the converter samples</h2>
+          <ol>
+            <li>The virtual strip rotates around the pivot.</li>
+            <li>Each LED center samples the image at every angle.</li>
+            <li>Firmware reads one contiguous RGB frame, then transmits SK9822 bytes.</li>
+          </ol>
+        </section>
+      </aside>
+    </main>
+
+    <footer>
+      <span>Designed for 35 × SK9822 LEDs on a 25 cm rotating arm</span>
+      <span>All image processing stays in this browser tab</span>
+    </footer>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="src/pov-core.js"></script>
+    <script src="src/app.js"></script>
+  </body>
+</html>
