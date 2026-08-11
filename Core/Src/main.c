@@ -108,9 +108,9 @@ volatile uint32_t wand_spi_hal_error = HAL_SPI_ERROR_NONE;
 /** Number of LEDs with nonzero RGB data in the currently selected frame. */
 volatile uint32_t wand_selected_lit_led_count = 0U;
 /** Set to zero in Live Expressions to stop the one-line-per-second output. */
-volatile uint8_t wand_debug_periodic_output_enabled = 1U;
+volatile uint8_t wand_debug_periodic_output_enabled = 0U;
 /** Set to zero at the main() breakpoint to skip the RGB boot self-test. */
-volatile uint8_t wand_debug_led_self_test_on_boot = 1U;
+volatile uint8_t wand_debug_led_self_test_on_boot = 0U;
 static uint8_t wand_debug_console_ready = 0U;
 static const char *wand_debug_boot_stage = "reset";
 #endif
@@ -1216,7 +1216,7 @@ static void MX_SDMMC1_SD_Init(void)
   hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
   hsd1.Init.BusWide = SDMMC_BUS_WIDE_4B;
   hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_DISABLE;
-  hsd1.Init.ClockDiv = 2;
+  hsd1.Init.ClockDiv = 12;
 }
 
 /**
