@@ -54,3 +54,18 @@ HAL_StatusTypeDef SK9822_TransmitFrame(SPI_HandleTypeDef *hspi,
                           (uint16_t)length,
                           SK9822_SPI_TIMEOUT_MS);
 }
+
+HAL_StatusTypeDef SK9822_TransmitFrameDma(SPI_HandleTypeDef *hspi,
+                                         const uint8_t *frame,
+                                         uint32_t length)
+{
+  if ((hspi == NULL) || (frame == NULL) ||
+      (length != SK9822_FRAME_BYTES))
+  {
+    return HAL_ERROR;
+  }
+
+  return HAL_SPI_Transmit_DMA(hspi,
+                              (uint8_t *)frame,
+                              (uint16_t)length);
+}

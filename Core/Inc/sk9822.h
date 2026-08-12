@@ -21,9 +21,19 @@ void SK9822_MakeBlankFrame(uint8_t *frame, uint32_t capacity);
 /** Check the fixed start/end framing used by this strip. */
 bool SK9822_IsFrameValid(const uint8_t *frame, uint32_t length);
 
-/** Transmit one prebuilt frame. The WAND1 payload is already in wire order. */
+/**
+ * Transmit one prebuilt frame synchronously.
+ *
+ * This is retained for boot diagnostics. Runtime playback should use the DMA
+ * API below so orientation polling is not blocked by the SPI wire time.
+ */
 HAL_StatusTypeDef SK9822_TransmitFrame(SPI_HandleTypeDef *hspi,
                                       const uint8_t *frame,
                                       uint32_t length);
+
+/** Start one asynchronous transmission using CubeMX-configured SPI TX DMA. */
+HAL_StatusTypeDef SK9822_TransmitFrameDma(SPI_HandleTypeDef *hspi,
+                                         const uint8_t *frame,
+                                         uint32_t length);
 
 #endif /* SK9822_H */

@@ -45,6 +45,8 @@
 /* USER CODE BEGIN PD */
 #define IMU_OUTPUT_DATA_RATE_HZ 1920.0f
 #define IMU_ORIENTATION_TIMER_SECONDS_PER_TICK 1.0e-6f
+#define IMU_GYRO_ACCEL_BURST_BYTES 12U
+#define IMU_TEMPERATURE_UPDATE_PERIOD_MS 67U
 #define WAND_DEBUG_STATUS_PERIOD_MS 1000U
 
 #if (WAND1_LED_COUNT != SK9822_LED_COUNT) || \
@@ -74,9 +76,17 @@ static stmdev_ctx_t imu_ctx;
 static uint8_t imu_orientation_pending_mask = 0U;
 static uint8_t imu_orientation_timestamp_valid = 0U;
 static uint32_t imu_orientation_last_timestamp_us = 0U;
+static uint32_t imu_temperature_last_read_ms = 0U;
 static uint32_t wand_last_orientation_update_count = 0U;
-static uint32_t wand_last_sample_index = 0U;
-static uint8_t wand_last_sample_valid = 0U;
+static uint32_t wand_requested_sample_index = 0U;
+static uint8_t wand_requested_sample_valid = 0U;
+static const uint8_t *wand_dma_pending_frame = NULL;
+static uint32_t wand_dma_pending_sample_index = 0U;
+static uint32_t wand_dma_active_sample_index = 0U;
+static volatile uint32_t wand_dma_completed_sample_index = 0U;
+static volatile uint32_t wand_dma_callback_error = HAL_SPI_ERROR_NONE;
+static volatile uint8_t wand_dma_completion_pending = 0U;
+static volatile uint8_t wand_dma_error_pending = 0U;
 
 /* The largest legal WAND1 payload is 1,801 complete 148-byte SK9822
  * frames (266,548 bytes).  STM32H743 RAM_D1 has room for it, so playback
@@ -94,16 +104,30 @@ volatile uint8_t wand_loaded = 0U;
 volatile float wand_angle_deg = 0.0f;
 /** Nearest frame currently selected from the preloaded WAND1 payload. */
 volatile uint32_t wand_sample_index = 0U;
-/** Number of new SK9822 frames sent by the playback loop. */
+/** Number of runtime SK9822 DMA frames completed successfully. */
 volatile uint32_t wand_frame_update_count = 0U;
 /** Number of SK9822 transmissions attempted, including the boot self-test. */
 volatile uint32_t wand_frame_attempt_count = 0U;
-/** Number of SK9822 transmissions that returned a non-HAL_OK result. */
+/** Number of SK9822 hardware failures; normal HAL_BUSY deferrals are excluded. */
 volatile uint32_t wand_spi_error_count = 0U;
 /** Most recent HAL SPI result returned while updating the strip. */
 volatile int32_t wand_spi_status = HAL_OK;
 /** Detailed HAL SPI error flags for the most recent transmission. */
 volatile uint32_t wand_spi_hal_error = HAL_SPI_ERROR_NONE;
+/** Nonzero while the one permitted SPI1 TX DMA transfer is active. */
+volatile uint8_t wand_dma_active = 0U;
+/** Nonzero when a newer frame is waiting to replace the active frame. */
+volatile uint8_t wand_dma_pending = 0U;
+/** Number of requests deferred because DMA or callback bookkeeping was busy. */
+volatile uint32_t wand_dma_busy_count = 0U;
+/** Number of obsolete pending frames replaced by a newer request. */
+volatile uint32_t wand_dma_coalesced_frame_count = 0U;
+/** Number of SPI DMA completion callbacks serviced by the main loop. */
+volatile uint32_t wand_dma_completion_count = 0U;
+/** Number of SPI DMA error callbacks serviced by the main loop. */
+volatile uint32_t wand_dma_error_callback_count = 0U;
+/** Most recent sample whose full DMA transfer completed successfully. */
+volatile uint32_t wand_dma_last_completed_sample_index = 0U;
 
 #if defined(DEBUG)
 /** Number of LEDs with nonzero RGB data in the currently selected frame. */
@@ -127,6 +151,14 @@ volatile uint8_t imu_i2c_address = LSM6DSV320X_I2C_ADD_L;
 
 /** Number of polling cycles in which at least one new sensor value was read. */
 volatile uint32_t imu_sample_count = 0U;
+/** Number of combined 12-byte gyro + low-g accelerometer I2C bursts. */
+volatile uint32_t imu_gyro_accel_burst_count = 0U;
+/** Number of fallback single-sensor reads when only one 1920 Hz DRDY was set. */
+volatile uint32_t imu_gyro_accel_split_read_count = 0U;
+/** Number of separately serviced 480 Hz high-g samples. */
+volatile uint32_t imu_high_g_read_count = 0U;
+/** Number of throttled temperature reads (nominally about 15 Hz). */
+volatile uint32_t imu_temperature_read_count = 0U;
 
 /** Low-g accelerometer X-axis register value (raw signed counts). */
 volatile int16_t imu_accel_x_raw = 0;
@@ -212,6 +244,9 @@ static int32_t IMU_Init(void);
 static int32_t IMU_ReadAll(void);
 static int32_t IMU_ReadSensors(imu_calibration_measurement_t *measurement);
 static void WAND_PlayCurrentAngle(void);
+static void WAND_ServiceLedDma(void);
+static HAL_StatusTypeDef WAND_RequestDmaFrame(const uint8_t *frame,
+                                              uint32_t sample_index);
 static HAL_StatusTypeDef WAND_TransmitTracked(const uint8_t *frame);
 #if defined(DEBUG)
 static uint32_t WAND_CountLitLeds(const uint8_t *frame);
@@ -366,136 +401,100 @@ static int32_t IMU_Init(void)
   return 0;
 }
 
-static int32_t IMU_ReadSensors(imu_calibration_measurement_t *measurement)
+static int16_t IMU_DecodeLittleEndianInt16(const uint8_t *bytes)
 {
-  lsm6dsv320x_data_ready_t data_ready = {0};
-  int16_t raw_axes[3];
-  int16_t raw_temperature;
-  uint8_t updated = 0U;
-
-  if (measurement != NULL)
-    *measurement = (imu_calibration_measurement_t){0};
-
-  if (lsm6dsv320x_flag_data_ready_get(&imu_ctx, &data_ready) != 0)
-    return -20;
-
-  if (data_ready.drdy_xl != 0U)
-  {
-    if (lsm6dsv320x_acceleration_raw_get(&imu_ctx, raw_axes) != 0)
-      return -21;
-
-    imu_accel_x_raw = raw_axes[0];
-    imu_accel_y_raw = raw_axes[1];
-    imu_accel_z_raw = raw_axes[2];
-    imu_accel_x_mg = lsm6dsv320x_from_fs4_to_mg(raw_axes[0]);
-    imu_accel_y_mg = lsm6dsv320x_from_fs4_to_mg(raw_axes[1]);
-    imu_accel_z_mg = lsm6dsv320x_from_fs4_to_mg(raw_axes[2]);
-    {
-      const imu_vector3_t raw_mg = {
-          imu_accel_x_mg, imu_accel_y_mg, imu_accel_z_mg};
-      imu_vector3_t calibrated_mg;
-
-      IMU_AccelApplyCalibration(&imu_low_g_calibration,
-                                &raw_mg, &calibrated_mg);
-      imu_accel_x_calibrated_mg = calibrated_mg.x;
-      imu_accel_y_calibrated_mg = calibrated_mg.y;
-      imu_accel_z_calibrated_mg = calibrated_mg.z;
-      if (measurement != NULL)
-      {
-        measurement->low_g_mg = raw_mg;
-        measurement->ready_mask |= IMU_SAMPLE_LOW_G_READY;
-      }
-    }
-    updated = 1U;
-  }
-
-  if (data_ready.drdy_gy != 0U)
-  {
-    if (lsm6dsv320x_angular_rate_raw_get(&imu_ctx, raw_axes) != 0)
-      return -22;
-
-    imu_gyro_x_raw = raw_axes[0];
-    imu_gyro_y_raw = raw_axes[1];
-    imu_gyro_z_raw = raw_axes[2];
-    imu_gyro_x_dps = lsm6dsv320x_from_fs4000_to_mdps(raw_axes[0]) / 1000.0f;
-    imu_gyro_y_dps = lsm6dsv320x_from_fs4000_to_mdps(raw_axes[1]) / 1000.0f;
-    imu_gyro_z_dps = lsm6dsv320x_from_fs4000_to_mdps(raw_axes[2]) / 1000.0f;
-    {
-      const imu_vector3_t raw_dps = {
-          imu_gyro_x_dps, imu_gyro_y_dps, imu_gyro_z_dps};
-      imu_vector3_t calibrated_dps;
-
-      IMU_GyroApplyCalibration(&imu_gyro_calibration,
-                               &raw_dps, &calibrated_dps);
-      imu_gyro_x_calibrated_dps = calibrated_dps.x;
-      imu_gyro_y_calibrated_dps = calibrated_dps.y;
-      imu_gyro_z_calibrated_dps = calibrated_dps.z;
-      if (measurement != NULL)
-      {
-        measurement->gyro_dps = raw_dps;
-        measurement->ready_mask |= IMU_SAMPLE_GYRO_READY;
-      }
-    }
-    updated = 1U;
-  }
-
-  if (data_ready.drdy_hgxl != 0U)
-  {
-    if (lsm6dsv320x_hg_acceleration_raw_get(&imu_ctx, raw_axes) != 0)
-      return -23;
-
-    imu_high_g_x_raw = raw_axes[0];
-    imu_high_g_y_raw = raw_axes[1];
-    imu_high_g_z_raw = raw_axes[2];
-    imu_high_g_x_mg = lsm6dsv320x_from_fs32_to_mg(raw_axes[0]);
-    imu_high_g_y_mg = lsm6dsv320x_from_fs32_to_mg(raw_axes[1]);
-    imu_high_g_z_mg = lsm6dsv320x_from_fs32_to_mg(raw_axes[2]);
-    {
-      const imu_vector3_t raw_mg = {
-          imu_high_g_x_mg, imu_high_g_y_mg, imu_high_g_z_mg};
-      imu_vector3_t calibrated_mg;
-
-      IMU_AccelApplyCalibration(&imu_high_g_calibration,
-                                &raw_mg, &calibrated_mg);
-      imu_high_g_x_calibrated_mg = calibrated_mg.x;
-      imu_high_g_y_calibrated_mg = calibrated_mg.y;
-      imu_high_g_z_calibrated_mg = calibrated_mg.z;
-      if (measurement != NULL)
-      {
-        measurement->high_g_mg = raw_mg;
-        measurement->ready_mask |= IMU_SAMPLE_HIGH_G_READY;
-      }
-    }
-    updated = 1U;
-  }
-
-  if (data_ready.drdy_temp != 0U)
-  {
-    if (lsm6dsv320x_temperature_raw_get(&imu_ctx, &raw_temperature) != 0)
-      return -24;
-
-    imu_temperature_raw = raw_temperature;
-    imu_temperature_c = lsm6dsv320x_from_lsb_to_celsius(raw_temperature);
-    updated = 1U;
-  }
-
-  if (updated != 0U)
-    imu_sample_count++;
-
-  return 0;
+  return (int16_t)((uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8));
 }
 
-static int32_t IMU_ReadAll(void)
+static void IMU_UpdateLowG(const int16_t raw_axes[3],
+                           imu_calibration_measurement_t *measurement)
 {
-  imu_calibration_measurement_t measurement;
-  int32_t status;
+  const imu_vector3_t raw_mg = {
+      lsm6dsv320x_from_fs4_to_mg(raw_axes[0]),
+      lsm6dsv320x_from_fs4_to_mg(raw_axes[1]),
+      lsm6dsv320x_from_fs4_to_mg(raw_axes[2])};
+  imu_vector3_t calibrated_mg;
 
-  status = IMU_ReadSensors(&measurement);
-  if (status != 0)
-    return status;
+  imu_accel_x_raw = raw_axes[0];
+  imu_accel_y_raw = raw_axes[1];
+  imu_accel_z_raw = raw_axes[2];
+  imu_accel_x_mg = raw_mg.x;
+  imu_accel_y_mg = raw_mg.y;
+  imu_accel_z_mg = raw_mg.z;
+  IMU_AccelApplyCalibration(&imu_low_g_calibration,
+                            &raw_mg, &calibrated_mg);
+  imu_accel_x_calibrated_mg = calibrated_mg.x;
+  imu_accel_y_calibrated_mg = calibrated_mg.y;
+  imu_accel_z_calibrated_mg = calibrated_mg.z;
 
+  if (measurement != NULL)
+  {
+    measurement->low_g_mg = raw_mg;
+    measurement->ready_mask |= IMU_SAMPLE_LOW_G_READY;
+  }
+}
+
+static void IMU_UpdateGyro(const int16_t raw_axes[3],
+                           imu_calibration_measurement_t *measurement)
+{
+  const imu_vector3_t raw_dps = {
+      lsm6dsv320x_from_fs4000_to_mdps(raw_axes[0]) / 1000.0f,
+      lsm6dsv320x_from_fs4000_to_mdps(raw_axes[1]) / 1000.0f,
+      lsm6dsv320x_from_fs4000_to_mdps(raw_axes[2]) / 1000.0f};
+  imu_vector3_t calibrated_dps;
+
+  imu_gyro_x_raw = raw_axes[0];
+  imu_gyro_y_raw = raw_axes[1];
+  imu_gyro_z_raw = raw_axes[2];
+  imu_gyro_x_dps = raw_dps.x;
+  imu_gyro_y_dps = raw_dps.y;
+  imu_gyro_z_dps = raw_dps.z;
+  IMU_GyroApplyCalibration(&imu_gyro_calibration,
+                           &raw_dps, &calibrated_dps);
+  imu_gyro_x_calibrated_dps = calibrated_dps.x;
+  imu_gyro_y_calibrated_dps = calibrated_dps.y;
+  imu_gyro_z_calibrated_dps = calibrated_dps.z;
+
+  if (measurement != NULL)
+  {
+    measurement->gyro_dps = raw_dps;
+    measurement->ready_mask |= IMU_SAMPLE_GYRO_READY;
+  }
+}
+
+static void IMU_UpdateHighG(const int16_t raw_axes[3],
+                            imu_calibration_measurement_t *measurement)
+{
+  const imu_vector3_t raw_mg = {
+      lsm6dsv320x_from_fs32_to_mg(raw_axes[0]),
+      lsm6dsv320x_from_fs32_to_mg(raw_axes[1]),
+      lsm6dsv320x_from_fs32_to_mg(raw_axes[2])};
+  imu_vector3_t calibrated_mg;
+
+  imu_high_g_x_raw = raw_axes[0];
+  imu_high_g_y_raw = raw_axes[1];
+  imu_high_g_z_raw = raw_axes[2];
+  imu_high_g_x_mg = raw_mg.x;
+  imu_high_g_y_mg = raw_mg.y;
+  imu_high_g_z_mg = raw_mg.z;
+  IMU_AccelApplyCalibration(&imu_high_g_calibration,
+                            &raw_mg, &calibrated_mg);
+  imu_high_g_x_calibrated_mg = calibrated_mg.x;
+  imu_high_g_y_calibrated_mg = calibrated_mg.y;
+  imu_high_g_z_calibrated_mg = calibrated_mg.z;
+
+  if (measurement != NULL)
+  {
+    measurement->high_g_mg = raw_mg;
+    measurement->ready_mask |= IMU_SAMPLE_HIGH_G_READY;
+  }
+}
+
+static void IMU_UpdateOrientation(
+    const imu_calibration_measurement_t *measurement)
+{
   imu_orientation_pending_mask |=
-      measurement.ready_mask &
+      measurement->ready_mask &
       (IMU_SAMPLE_LOW_G_READY | IMU_SAMPLE_GYRO_READY);
 
   if ((imu_orientation_pending_mask &
@@ -525,6 +524,147 @@ static int32_t IMU_ReadAll(void)
                           imu_accel_z_calibrated_mg,
                           sample_period_s);
   }
+}
+
+/* Calibration deliberately retains independent sensor reads.  Its acquisition
+ * callback needs each source and is kept separate from runtime scheduling. */
+static int32_t IMU_ReadSensors(imu_calibration_measurement_t *measurement)
+{
+  lsm6dsv320x_data_ready_t data_ready = {0};
+  int16_t raw_axes[3];
+  int16_t raw_temperature;
+  uint8_t updated = 0U;
+
+  if (measurement != NULL)
+    *measurement = (imu_calibration_measurement_t){0};
+
+  if (lsm6dsv320x_flag_data_ready_get(&imu_ctx, &data_ready) != 0)
+    return -20;
+
+  if (data_ready.drdy_xl != 0U)
+  {
+    if (lsm6dsv320x_acceleration_raw_get(&imu_ctx, raw_axes) != 0)
+      return -21;
+    IMU_UpdateLowG(raw_axes, measurement);
+    updated = 1U;
+  }
+
+  if (data_ready.drdy_gy != 0U)
+  {
+    if (lsm6dsv320x_angular_rate_raw_get(&imu_ctx, raw_axes) != 0)
+      return -22;
+    IMU_UpdateGyro(raw_axes, measurement);
+    updated = 1U;
+  }
+
+  if (data_ready.drdy_hgxl != 0U)
+  {
+    if (lsm6dsv320x_hg_acceleration_raw_get(&imu_ctx, raw_axes) != 0)
+      return -23;
+    IMU_UpdateHighG(raw_axes, measurement);
+    updated = 1U;
+  }
+
+  if (data_ready.drdy_temp != 0U)
+  {
+    if (lsm6dsv320x_temperature_raw_get(&imu_ctx, &raw_temperature) != 0)
+      return -24;
+    imu_temperature_raw = raw_temperature;
+    imu_temperature_c = lsm6dsv320x_from_lsb_to_celsius(raw_temperature);
+    updated = 1U;
+  }
+
+  if (updated != 0U)
+    imu_sample_count++;
+
+  return 0;
+}
+
+static int32_t IMU_ReadAll(void)
+{
+  lsm6dsv320x_data_ready_t data_ready = {0};
+  imu_calibration_measurement_t measurement = {0};
+  uint8_t gyro_accel_bytes[IMU_GYRO_ACCEL_BURST_BYTES];
+  int16_t raw_accel[3];
+  int16_t raw_gyro[3];
+  int16_t raw_axes[3];
+  int16_t raw_temperature;
+  uint8_t updated = 0U;
+
+  if (lsm6dsv320x_flag_data_ready_get(&imu_ctx, &data_ready) != 0)
+    return -20;
+
+  if ((data_ready.drdy_gy != 0U) && (data_ready.drdy_xl != 0U))
+  {
+    /* OUTX_L_G..OUTZ_H_A are contiguous and the device auto-increment is on.
+     * Byte order matches the ST driver's individual raw-get functions. */
+    if (lsm6dsv320x_read_reg(&imu_ctx, LSM6DSV320X_OUTX_L_G,
+                             gyro_accel_bytes,
+                             IMU_GYRO_ACCEL_BURST_BYTES) != 0)
+    {
+      return -25;
+    }
+
+    raw_gyro[0] = IMU_DecodeLittleEndianInt16(&gyro_accel_bytes[0]);
+    raw_gyro[1] = IMU_DecodeLittleEndianInt16(&gyro_accel_bytes[2]);
+    raw_gyro[2] = IMU_DecodeLittleEndianInt16(&gyro_accel_bytes[4]);
+    raw_accel[0] = IMU_DecodeLittleEndianInt16(&gyro_accel_bytes[6]);
+    raw_accel[1] = IMU_DecodeLittleEndianInt16(&gyro_accel_bytes[8]);
+    raw_accel[2] = IMU_DecodeLittleEndianInt16(&gyro_accel_bytes[10]);
+    IMU_UpdateGyro(raw_gyro, &measurement);
+    IMU_UpdateLowG(raw_accel, &measurement);
+    imu_gyro_accel_burst_count++;
+    updated = 1U;
+  }
+  else
+  {
+    /* Preserve data if the two same-rate DRDY bits are briefly out of phase. */
+    if (data_ready.drdy_xl != 0U)
+    {
+      if (lsm6dsv320x_acceleration_raw_get(&imu_ctx, raw_axes) != 0)
+        return -21;
+      IMU_UpdateLowG(raw_axes, &measurement);
+      imu_gyro_accel_split_read_count++;
+      updated = 1U;
+    }
+
+    if (data_ready.drdy_gy != 0U)
+    {
+      if (lsm6dsv320x_angular_rate_raw_get(&imu_ctx, raw_axes) != 0)
+        return -22;
+      IMU_UpdateGyro(raw_axes, &measurement);
+      imu_gyro_accel_split_read_count++;
+      updated = 1U;
+    }
+  }
+
+  /* Update Fusion immediately; lower-rate auxiliary reads happen afterwards. */
+  IMU_UpdateOrientation(&measurement);
+
+  if (data_ready.drdy_hgxl != 0U)
+  {
+    if (lsm6dsv320x_hg_acceleration_raw_get(&imu_ctx, raw_axes) != 0)
+      return -23;
+    IMU_UpdateHighG(raw_axes, NULL);
+    imu_high_g_read_count++;
+    updated = 1U;
+  }
+
+  if ((data_ready.drdy_temp != 0U) &&
+      ((uint32_t)(HAL_GetTick() - imu_temperature_last_read_ms) >=
+       IMU_TEMPERATURE_UPDATE_PERIOD_MS))
+  {
+    if (lsm6dsv320x_temperature_raw_get(&imu_ctx, &raw_temperature) != 0)
+      return -24;
+    imu_temperature_raw = raw_temperature;
+    imu_temperature_c = lsm6dsv320x_from_lsb_to_celsius(raw_temperature);
+    imu_temperature_last_read_ms = HAL_GetTick();
+    imu_temperature_read_count++;
+    updated = 1U;
+  }
+
+  if (updated != 0U)
+    imu_sample_count++;
 
   return 0;
 }
@@ -565,10 +705,159 @@ static HAL_StatusTypeDef WAND_TransmitTracked(const uint8_t *frame)
   status = SK9822_TransmitFrame(&hspi1, frame, SK9822_FRAME_BYTES);
   wand_spi_status = (int32_t)status;
   wand_spi_hal_error = HAL_SPI_GetError(&hspi1);
-  if (status != HAL_OK)
+  if ((status != HAL_OK) && (status != HAL_BUSY))
     wand_spi_error_count++;
 
   return status;
+}
+
+static void WAND_StoreLatestPending(const uint8_t *frame,
+                                    uint32_t sample_index)
+{
+  if (wand_dma_pending != 0U)
+    wand_dma_coalesced_frame_count++;
+
+  wand_dma_pending_frame = frame;
+  wand_dma_pending_sample_index = sample_index;
+  wand_dma_pending = 1U;
+}
+
+static HAL_StatusTypeDef WAND_RequestDmaFrame(const uint8_t *frame,
+                                              uint32_t sample_index)
+{
+  HAL_StatusTypeDef status;
+  uint32_t primask;
+
+  if (frame == NULL)
+    return HAL_ERROR;
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  if ((wand_dma_active != 0U) ||
+      (wand_dma_completion_pending != 0U) ||
+      (wand_dma_error_pending != 0U))
+  {
+    WAND_StoreLatestPending(frame, sample_index);
+    wand_dma_busy_count++;
+    if (primask == 0U)
+      __enable_irq();
+    wand_spi_status = HAL_BUSY;
+    return HAL_BUSY;
+  }
+
+  /* Reserve the sole DMA slot before interrupts are restored. */
+  wand_dma_active_sample_index = sample_index;
+  wand_dma_active = 1U;
+  if (primask == 0U)
+    __enable_irq();
+
+  wand_frame_attempt_count++;
+  status = SK9822_TransmitFrameDma(&hspi1, frame, SK9822_FRAME_BYTES);
+  wand_spi_status = (int32_t)status;
+  wand_spi_hal_error = HAL_SPI_GetError(&hspi1);
+  if (status == HAL_OK)
+    return status;
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  wand_dma_active = 0U;
+  if (status == HAL_BUSY)
+  {
+    /* HAL can still report busy during a narrow state transition.  Retain the
+     * frame for a main-loop retry and do not classify this as a failure. */
+    WAND_StoreLatestPending(frame, sample_index);
+    wand_dma_busy_count++;
+  }
+  if (primask == 0U)
+    __enable_irq();
+
+  if (status != HAL_BUSY)
+    wand_spi_error_count++;
+
+  return status;
+}
+
+static void WAND_ServiceLedDma(void)
+{
+  const uint8_t *pending_frame = NULL;
+  uint32_t pending_sample_index = 0U;
+  uint32_t completed_sample_index = 0U;
+  uint32_t callback_error = HAL_SPI_ERROR_NONE;
+  uint32_t primask;
+  uint8_t completed;
+  uint8_t failed;
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  completed = wand_dma_completion_pending;
+  failed = wand_dma_error_pending;
+  if (completed != 0U)
+  {
+    completed_sample_index = wand_dma_completed_sample_index;
+    wand_dma_completion_pending = 0U;
+  }
+  if (failed != 0U)
+  {
+    callback_error = wand_dma_callback_error;
+    wand_dma_error_pending = 0U;
+  }
+  if (primask == 0U)
+    __enable_irq();
+
+  if (completed != 0U)
+  {
+    wand_dma_completion_count++;
+    wand_frame_update_count++;
+    wand_dma_last_completed_sample_index = completed_sample_index;
+    wand_spi_status = HAL_OK;
+    wand_spi_hal_error = HAL_SPI_ERROR_NONE;
+  }
+  if (failed != 0U)
+  {
+    wand_dma_error_callback_count++;
+    wand_spi_error_count++;
+    wand_spi_status = HAL_ERROR;
+    wand_spi_hal_error = callback_error;
+  }
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  if ((wand_dma_active == 0U) &&
+      (wand_dma_completion_pending == 0U) &&
+      (wand_dma_error_pending == 0U) &&
+      (wand_dma_pending != 0U))
+  {
+    pending_frame = wand_dma_pending_frame;
+    pending_sample_index = wand_dma_pending_sample_index;
+    wand_dma_pending = 0U;
+  }
+  if (primask == 0U)
+    __enable_irq();
+
+  if (pending_frame != NULL)
+    (void)WAND_RequestDmaFrame(pending_frame, pending_sample_index);
+}
+
+void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+  if (hspi == &hspi1)
+  {
+    /* ISR work is intentionally limited to publishing completion state. */
+    wand_dma_completed_sample_index = wand_dma_active_sample_index;
+    wand_dma_active = 0U;
+    wand_dma_completion_pending = 1U;
+  }
+}
+
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
+{
+  if (hspi == &hspi1)
+  {
+    /* Defer counters, diagnostics, retries, and all printing to main context. */
+    wand_dma_callback_error = hspi->ErrorCode;
+    wand_dma_active = 0U;
+    wand_dma_error_pending = 1U;
+  }
 }
 
 #if defined(DEBUG)
@@ -817,7 +1106,8 @@ static void WAND_DebugPoll(void)
   (void)printf(
       "[RUN] loaded=%u imu=%ld orient=%lu Hz startup=%u roll=%ld mdeg "
       "wand=%ld mdeg frame=%lu/%lu lit=%lu tx_ok=%lu attempts=%lu "
-      "spi=%s errors=%lu hal=0x%08lX.\r\n",
+      "dma=%u pending=%u coalesced=%lu busy=%lu spi=%s errors=%lu "
+      "hal=0x%08lX burst=%lu split=%lu hg=%lu temp=%lu.\r\n",
       (unsigned int)wand_loaded,
       (long)imu_status,
       (unsigned long)orientation_rate_hz,
@@ -829,9 +1119,17 @@ static void WAND_DebugPoll(void)
       (unsigned long)wand_selected_lit_led_count,
       (unsigned long)wand_frame_update_count,
       (unsigned long)wand_frame_attempt_count,
+      (unsigned int)wand_dma_active,
+      (unsigned int)wand_dma_pending,
+      (unsigned long)wand_dma_coalesced_frame_count,
+      (unsigned long)wand_dma_busy_count,
       WAND_DebugHalStatusName(wand_spi_status),
       (unsigned long)wand_spi_error_count,
-      (unsigned long)wand_spi_hal_error);
+      (unsigned long)wand_spi_hal_error,
+      (unsigned long)imu_gyro_accel_burst_count,
+      (unsigned long)imu_gyro_accel_split_read_count,
+      (unsigned long)imu_high_g_read_count,
+      (unsigned long)imu_temperature_read_count);
 
   if (orientation_delta == 0U)
   {
@@ -855,7 +1153,7 @@ static void WAND_DebugPoll(void)
         (unsigned long)wand_sample_index);
     last_blank_sample = wand_sample_index;
   }
-  if (wand_spi_status != HAL_OK)
+  if ((wand_spi_status != HAL_OK) && (wand_spi_status != HAL_BUSY))
   {
     (void)printf(
         "[ERROR][LED] SPI transmission is failing. HAL status=%s, "
@@ -892,8 +1190,8 @@ static void WAND_PlayCurrentAngle(void)
 
   /* The sensor runs faster than most exported angle grids.  Avoid spending
    * SPI bandwidth when consecutive orientation estimates select one frame. */
-  if ((wand_last_sample_valid != 0U) &&
-      (sample_index == wand_last_sample_index))
+  if ((wand_requested_sample_valid != 0U) &&
+      (sample_index == wand_requested_sample_index))
   {
     return;
   }
@@ -902,13 +1200,12 @@ static void WAND_PlayCurrentAngle(void)
 #if defined(DEBUG)
   wand_selected_lit_led_count = WAND_CountLitLeds(frame);
 #endif
-  wand_spi_status = (int32_t)WAND_TransmitTracked(frame);
-  if (wand_spi_status == HAL_OK)
-  {
-    wand_last_sample_index = sample_index;
-    wand_last_sample_valid = 1U;
-    wand_frame_update_count++;
-  }
+  /* The payload is immutable after startup, so both active and pending DMA
+   * pointers remain valid.  Updating this marker before queuing also prevents
+   * duplicate requests for the same angle while a transfer is in flight. */
+  wand_requested_sample_index = sample_index;
+  wand_requested_sample_valid = 1U;
+  wand_spi_status = (int32_t)WAND_RequestDmaFrame(frame, sample_index);
 }
 /* USER CODE END 0 */
 
@@ -1057,6 +1354,7 @@ int main(void)
   {
     imu_status = IMU_ReadAll();
     WAND_PlayCurrentAngle();
+    WAND_ServiceLedDma();
 #if defined(DEBUG)
     WAND_DebugPoll();
 #endif
