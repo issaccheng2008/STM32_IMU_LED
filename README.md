@@ -181,7 +181,7 @@ invalid payload.  Exact values are defined in `Core/Inc/wand_storage.h`.
 
 ```text
 00 00 00 00
-35 × [111BBBBB, green, red, blue]
+35 × [111BBBBB, blue, green, red]
 FF FF FF FF
 ```
 

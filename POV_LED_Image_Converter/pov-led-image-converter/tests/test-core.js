@@ -65,9 +65,19 @@ function run() {
   });
   assert.strictEqual(conversion.config.sampleCount, 5);
   assert.strictEqual(conversion.payload.length, 5 * 148);
-  assert.deepStrictEqual(Array.from(conversion.payload.subarray(0, 8)), [0, 0, 0, 0, 0xE3, 0x34, 0x12, 0x56]);
+  assert.deepStrictEqual(Array.from(conversion.payload.subarray(0, 8)), [0, 0, 0, 0, 0xE3, 0x56, 0x34, 0x12]);
   assert.deepStrictEqual(Array.from(conversion.payload.subarray(144, 148)), [0xFF, 0xFF, 0xFF, 0xFF]);
   assert.deepStrictEqual(Core.frameRgb(conversion, 0, 0), [0x12, 0x34, 0x56]);
+
+  const primaryColors = [
+    { rgba: [255, 0, 0, 255], wireBgr: [0, 0, 255] },
+    { rgba: [0, 255, 0, 255], wireBgr: [0, 255, 0] },
+    { rgba: [0, 0, 255, 255], wireBgr: [255, 0, 0] },
+  ];
+  for (const primary of primaryColors) {
+    const primaryConversion = Core.convertImage(image(1, 1, primary.rgba), conversion.config);
+    assert.deepStrictEqual(Array.from(primaryConversion.payload.subarray(5, 8)), primary.wireBgr);
+  }
 
   const binary = Core.buildWandBinary(conversion);
   assert.strictEqual(binary.length, Core.HEADER_BYTES + conversion.payload.length);
@@ -97,7 +107,7 @@ function run() {
   assert.strictEqual(json.frames[2].angle_deg, 0);
   assert.strictEqual(json.frames[4].angle_deg, 90);
   assert.deepStrictEqual(json.frames[0].leds[0].rgb, [0x12, 0x34, 0x56]);
-  assert.strictEqual(json.frames[0].leds[0].sk9822_bytes_hex, "E3341256");
+  assert.strictEqual(json.frames[0].leds[0].sk9822_bytes_hex, "E3563412");
   assert.strictEqual(json.frames[0].wire_frame_hex.length, 148 * 2);
 
   console.log("All WAND core tests passed.");

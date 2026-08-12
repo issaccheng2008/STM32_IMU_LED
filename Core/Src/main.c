@@ -1038,11 +1038,11 @@ static void WAND_DebugRunLedSelfTest(void)
                             led * SK9822_BYTES_PER_LED;
     wand_blank_frame[offset] = 0xE1U; /* 1/31 global brightness. */
     if (led < 12U)
-      wand_blank_frame[offset + 2U] = 0xFFU; /* Red. */
+      wand_blank_frame[offset + 3U] = 0xFFU; /* Red. */
     else if (led < 24U)
-      wand_blank_frame[offset + 1U] = 0xFFU; /* Green. */
+      wand_blank_frame[offset + 2U] = 0xFFU; /* Green. */
     else
-      wand_blank_frame[offset + 3U] = 0xFFU; /* Blue. */
+      wand_blank_frame[offset + 1U] = 0xFFU; /* Blue. */
   }
 
   (void)printf(
