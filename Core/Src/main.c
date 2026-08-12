@@ -135,7 +135,7 @@ volatile uint32_t wand_selected_lit_led_count = 0U;
 /** Set to zero in Live Expressions to stop the one-line-per-second output. */
 volatile uint8_t wand_debug_periodic_output_enabled = 0U;
 /** Set to zero at the main() breakpoint to skip the RGB boot self-test. */
-volatile uint8_t wand_debug_led_self_test_on_boot = 0U;
+volatile uint8_t wand_debug_led_self_test_on_boot = 1U;
 static uint8_t wand_debug_console_ready = 0U;
 static const char *wand_debug_boot_stage = "reset";
 #endif
