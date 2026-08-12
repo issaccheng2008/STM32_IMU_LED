@@ -51,8 +51,8 @@ int main(void)
   payload = &file_bytes[WAND1_HEADER_BYTES];
   if (WAND_ValidatePayload(&header, payload, header.payload_bytes) != WAND_OK)
     return fail("C parser rejected the JavaScript payload");
-  if ((payload[4] != 0xE3U) || (payload[5] != 0x34U) ||
-      (payload[6] != 0x12U) || (payload[7] != 0x56U))
+  if ((payload[4] != 0xE3U) || (payload[5] != 0x56U) ||
+      (payload[6] != 0x34U) || (payload[7] != 0x12U))
   {
     return fail("direct SK9822 command bytes differ");
   }

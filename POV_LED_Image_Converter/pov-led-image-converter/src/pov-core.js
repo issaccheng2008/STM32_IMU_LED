@@ -181,9 +181,9 @@
         const output = frameOffset + SK9822_START_BYTES + led * SK9822_BYTES_PER_LED;
 
         payload[output] = 0xE0 | config.globalBrightness;
-        payload[output + 1] = green;
-        payload[output + 2] = red;
-        payload[output + 3] = blue;
+        payload[output + 1] = blue;
+        payload[output + 2] = green;
+        payload[output + 3] = red;
         if (red || green || blue) litSamples += 1;
       }
 
@@ -291,7 +291,7 @@
     const sample = clamp(Math.round(sampleIndex), 0, config.sampleCount - 1);
     const led = clamp(Math.round(ledIndex), 0, config.ledCount - 1);
     const offset = sample * config.frameBytes + SK9822_START_BYTES + led * SK9822_BYTES_PER_LED;
-    return [conversion.payload[offset + 2], conversion.payload[offset + 1], conversion.payload[offset + 3]];
+    return [conversion.payload[offset + 3], conversion.payload[offset + 2], conversion.payload[offset + 1]];
   }
 
   function bytesToHex(bytes) {
@@ -310,7 +310,7 @@
         leds.push({
           led,
           global_brightness: command[0] & 0x1F,
-          rgb: [command[2], command[1], command[3]],
+          rgb: [command[3], command[2], command[1]],
           sk9822_bytes_hex: bytesToHex(command),
         });
       }
@@ -325,7 +325,7 @@
       format: "WAND1-JSON",
       version: FORMAT_VERSION,
       source_image: sourceName || "unknown",
-      binary_payload: "Complete SK9822 frames: 00000000 + 35 x [111BBBBB,G,R,B] + FFFFFFFF",
+      binary_payload: "Complete SK9822 frames: 00000000 + 35 x [111BBBBB,B,G,R] + FFFFFFFF",
       geometry: {
         led_count: config.ledCount,
         strip_length_cm: config.stripLengthCm,

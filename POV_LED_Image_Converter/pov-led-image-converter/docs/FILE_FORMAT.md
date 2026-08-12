@@ -61,9 +61,9 @@ Each four-byte pixel command is already in wire order:
 | Pixel offset | Meaning |
 |---:|---|
 | 0 | `111BBBBB`, where `BBBBB` is global brightness 0–31 |
-| 1 | Green, 0–255 |
-| 2 | Red, 0–255 |
-| 3 | Blue, 0–255 |
+| 1 | Blue, 0–255 |
+| 2 | Green, 0–255 |
+| 3 | Red, 0–255 |
 
 The STM32 sends all 148 bytes without RGB conversion:
 

@@ -111,7 +111,7 @@ firmware sends only when a new orientation estimate selects a different frame.
 
 ```text
 48-byte WAND1 header
-frame -90°: 00 00 00 00 + 35 × [111BBBBB,G,R,B] + FF FF FF FF
+frame -90°: 00 00 00 00 + 35 × [111BBBBB,B,G,R] + FF FF FF FF
 next angle frame
 ...
 frame +90°
